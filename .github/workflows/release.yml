@@ -25,10 +25,10 @@ jobs:
             asset: huitzo-aarch64-unknown-linux-musl
             cross: true
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-latest
             asset: huitzo-x86_64-apple-darwin
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-latest
             asset: huitzo-aarch64-apple-darwin
           - target: x86_64-pc-windows-msvc
             os: windows-latest
