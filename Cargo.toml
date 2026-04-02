@@ -1,0 +1,26 @@
+[package]
+name = "huitzo"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Huitzo CLI launcher — manages Python environment and execs into huitzo_cli"
+license = "Proprietary"
+repository = "https://github.com/Huitzo-Inc/huitzo-launcher"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = "3"
+sha2 = "0.10"
+dirs = "6"
+which = "7"
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.29", features = ["process"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
