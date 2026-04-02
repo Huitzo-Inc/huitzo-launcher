@@ -128,8 +128,8 @@ fn bootstrap() -> Result<(), Error> {
     install::install_package("huitzo", index_url.as_deref())?;
 
     // Write manifest
-    let version = install::get_installed_version("huitzo")?
-        .unwrap_or_else(|| "unknown".to_string());
+    let version =
+        install::get_installed_version("huitzo")?.unwrap_or_else(|| "unknown".to_string());
     eprintln!("  Installed huitzo {version}");
 
     manifest::save(&Manifest {

@@ -1,6 +1,6 @@
+use crate::errors::Error;
 use std::path::PathBuf;
 use std::process::Command;
-use crate::errors::Error;
 
 /// Information about a discovered Python interpreter.
 pub struct PythonInfo {

@@ -61,12 +61,12 @@ impl fmt::Debug for Error {
 /// Exit codes following sysexits.h conventions.
 pub fn exit_code(err: &Error) -> i32 {
     match err {
-        Error::NoPython => 78,       // EX_CONFIG
-        Error::VenvCreate(_) => 73,  // EX_CANTCREAT
-        Error::PipInstall(_) => 69,  // EX_UNAVAILABLE
-        Error::Network(_) => 69,     // EX_UNAVAILABLE
-        Error::Manifest(_) => 66,    // EX_NOINPUT
+        Error::NoPython => 78,      // EX_CONFIG
+        Error::VenvCreate(_) => 73, // EX_CANTCREAT
+        Error::PipInstall(_) => 69, // EX_UNAVAILABLE
+        Error::Network(_) => 69,    // EX_UNAVAILABLE
+        Error::Manifest(_) => 66,   // EX_NOINPUT
         Error::SelfUpdate(_) => 1,
-        Error::Exec(_) => 126,       // Command found but not executable
+        Error::Exec(_) => 126, // Command found but not executable
     }
 }

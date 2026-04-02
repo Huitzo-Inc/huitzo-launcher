@@ -47,14 +47,9 @@ pub fn background_check() {
 
 /// Query PyPI JSON API for the latest version of the huitzo package.
 fn check_pypi_version() -> Option<String> {
-    let mut response = ureq::get(PYPI_URL)
-        .call()
-        .ok()?;
+    let mut response = ureq::get(PYPI_URL).call().ok()?;
 
-    let body_str = response
-        .body_mut()
-        .read_to_string()
-        .ok()?;
+    let body_str = response.body_mut().read_to_string().ok()?;
 
     let body: serde_json::Value = serde_json::from_str(&body_str).ok()?;
 
@@ -184,9 +179,7 @@ fn find_asset_url(assets: &[serde_json::Value], name: &str) -> Result<String, Er
             return asset["browser_download_url"]
                 .as_str()
                 .map(|s| s.to_string())
-                .ok_or_else(|| {
-                    Error::SelfUpdate(format!("Asset '{name}' has no download URL"))
-                });
+                .ok_or_else(|| Error::SelfUpdate(format!("Asset '{name}' has no download URL")));
         }
     }
     Err(Error::SelfUpdate(format!(
@@ -233,10 +226,7 @@ fn download_checksum(url: &str) -> Result<String, Error> {
 /// Download a binary to `dest`, computing SHA-256 incrementally.
 ///
 /// Returns the hex-encoded hash of the downloaded file.
-fn download_and_hash(
-    url: &str,
-    dest: &std::path::Path,
-) -> Result<String, Error> {
+fn download_and_hash(url: &str, dest: &std::path::Path) -> Result<String, Error> {
     let mut response = ureq::get(url)
         .header("User-Agent", "huitzo-launcher")
         .call()
@@ -269,11 +259,7 @@ fn download_and_hash(
 ///
 /// Compares numeric segments left-to-right.
 fn version_is_newer(latest: &str, current: &str) -> bool {
-    let parse = |v: &str| -> Vec<u32> {
-        v.split('.')
-            .filter_map(|s| s.parse().ok())
-            .collect()
-    };
+    let parse = |v: &str| -> Vec<u32> { v.split('.').filter_map(|s| s.parse().ok()).collect() };
     let l = parse(latest);
     let c = parse(current);
     l > c
@@ -306,7 +292,10 @@ mod tests {
     #[test]
     fn platform_asset_name_returns_valid_name() {
         let name = platform_asset_name();
-        assert!(name.starts_with("huitzo-"), "Expected 'huitzo-' prefix, got: {name}");
+        assert!(
+            name.starts_with("huitzo-"),
+            "Expected 'huitzo-' prefix, got: {name}"
+        );
         // Should contain a known target triple fragment
         let valid_fragments = [
             "x86_64-unknown-linux-musl",

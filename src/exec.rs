@@ -26,8 +26,8 @@ fn exec_unix(venv_python: &Path, args: &[String]) -> Result<(), Error> {
         .to_str()
         .ok_or_else(|| Error::Exec("Python path contains invalid UTF-8".to_string()))?;
 
-    let python = CString::new(python_str)
-        .map_err(|e| Error::Exec(format!("Invalid python path: {e}")))?;
+    let python =
+        CString::new(python_str).map_err(|e| Error::Exec(format!("Invalid python path: {e}")))?;
 
     let mut argv: Vec<CString> = Vec::with_capacity(args.len() + 3);
     argv.push(python.clone());
@@ -40,8 +40,7 @@ fn exec_unix(venv_python: &Path, args: &[String]) -> Result<(), Error> {
         );
     }
 
-    nix::unistd::execvp(&python, &argv)
-        .map_err(|e| Error::Exec(format!("execvp failed: {e}")))?;
+    nix::unistd::execvp(&python, &argv).map_err(|e| Error::Exec(format!("execvp failed: {e}")))?;
 
     unreachable!()
 }
