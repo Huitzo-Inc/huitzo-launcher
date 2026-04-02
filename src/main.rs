@@ -38,9 +38,11 @@ fn main() {
     }
 
     if args.iter().any(|a| a == "--launcher-update") {
-        eprintln!("Self-update is not yet implemented (Phase 3).");
-        eprintln!("Download the latest binary from: https://github.com/Huitzo-Inc/huitzo-launcher/releases");
-        std::process::exit(1);
+        if let Err(e) = update::self_update() {
+            eprintln!("Error: {e}");
+            std::process::exit(errors::exit_code(&e));
+        }
+        return;
     }
 
     run(args);
