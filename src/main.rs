@@ -82,10 +82,8 @@ fn run(args: Vec<String>) {
                     // Clear pending update
                     let mut updated = manifest::load().unwrap_or_else(|| m.clone_for_update());
                     updated.pending_update = None;
-                    if let Ok(ver) = install::get_installed_version("huitzo") {
-                        if let Some(v) = ver {
-                            updated.huitzo_version = v;
-                        }
+                    if let Ok(Some(v)) = install::get_installed_version("huitzo") {
+                        updated.huitzo_version = v;
                     }
                     let _ = manifest::save(&updated);
                 }

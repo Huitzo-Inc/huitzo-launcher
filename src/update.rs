@@ -208,7 +208,6 @@ fn download_checksum(url: &str) -> Result<String, Error> {
 
     // Parse: either "hash  filename" or just "hash"
     let hash = body
-        .trim()
         .split_whitespace()
         .next()
         .ok_or_else(|| Error::SelfUpdate("Empty checksum file".to_string()))?;
