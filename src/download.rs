@@ -170,9 +170,9 @@ pub fn download_wheel(release_version: &str, wheel: &WheelInfo) -> Result<PathBu
 
     let dest = cache_dir.join(&wheel.filename);
 
-    // Construct download URL from the GitHub release
+    // Construct download URL from the GitHub release (hosted on public launcher repo)
     let url = format!(
-        "https://github.com/Huitzo-Inc/cli/releases/download/v{}/{}",
+        "https://github.com/Huitzo-Inc/huitzo-launcher/releases/download/cli-v{}/{}",
         release_version, wheel.filename
     );
 
