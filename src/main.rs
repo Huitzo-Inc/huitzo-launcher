@@ -165,9 +165,9 @@ fn bootstrap() -> Result<(), Error> {
 
     // Install huitzo: try compiled wheel from GitHub Releases, fall back to PyPI
     eprintln!("  Installing huitzo...");
-    if let Err(_wheel_err) = install_from_release() {
+    if let Err(wheel_err) = install_from_release() {
         // Fallback to PyPI for backwards compatibility
-        eprintln!("  Compiled wheel unavailable, falling back to PyPI...");
+        eprintln!("  Compiled wheel unavailable ({wheel_err}), falling back to PyPI...");
         let index_url = std::env::var("HUITZO_INDEX_URL").ok();
         install::install_package("huitzo", index_url.as_deref())?;
     }
