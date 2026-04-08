@@ -11,6 +11,7 @@ const CLI_RELEASES_URL: &str = "https://api.github.com/repos/Huitzo-Inc/cli/rele
 #[derive(Debug)]
 pub struct CliRelease {
     pub version: String,
+    #[allow(dead_code)] // Reserved for future version-gating of launcher updates
     pub min_launcher_version: String,
     pub wheels: Vec<WheelInfo>,
 }
