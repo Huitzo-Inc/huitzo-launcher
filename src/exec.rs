@@ -6,7 +6,17 @@ use crate::errors::Error;
 ///
 /// On Unix, this uses `execvp()` — the launcher process is replaced entirely.
 /// On Windows, this spawns a child process and propagates its exit code.
+///
+/// Sets `HUITZO_MANAGED=1` so the Python CLI can detect it is running under
+/// the launcher (e.g., to suppress "run pip install --upgrade" messages).
 pub fn exec_into_python(venv_python: &Path, args: &[String]) -> Result<(), Error> {
+    // Signal to the Python CLI that it's running under the launcher.
+    // SAFETY: This is called from main() before any threads are spawned for
+    // the exec path (the background update thread is already detached and
+    // doesn't read this variable). On Unix, execvp replaces the process
+    // immediately after this point, so no concurrent access is possible.
+    unsafe { std::env::set_var("HUITZO_MANAGED", "1") };
+
     #[cfg(unix)]
     {
         exec_unix(venv_python, args)

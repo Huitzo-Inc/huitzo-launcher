@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::process::Command;
 
 use crate::dirs;
@@ -22,6 +23,34 @@ pub fn install_package(package: &str, index_url: Option<&str>) -> Result<(), Err
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(Error::PipInstall(stderr.to_string()));
+    }
+
+    Ok(())
+}
+
+/// Install a compiled wheel from a local file path into the managed venv.
+///
+/// Uses `pip install --force-reinstall` to ensure the compiled wheel replaces
+/// any previously installed version.
+pub fn install_wheel(wheel_path: &Path) -> Result<(), Error> {
+    let python = dirs::venv_python();
+    let output = Command::new(&python)
+        .args([
+            "-m",
+            "pip",
+            "install",
+            "--force-reinstall",
+            "--quiet",
+            &wheel_path.to_string_lossy(),
+        ])
+        .output()
+        .map_err(|e| Error::PipInstall(format!("Failed to run pip install wheel: {e}")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(Error::PipInstall(format!(
+            "Failed to install wheel: {stderr}"
+        )));
     }
 
     Ok(())
