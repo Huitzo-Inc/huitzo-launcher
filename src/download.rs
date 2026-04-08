@@ -4,8 +4,9 @@ use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::PathBuf;
 
-/// GitHub Releases API URL for the CLI repository.
-const CLI_RELEASES_URL: &str = "https://api.github.com/repos/Huitzo-Inc/cli/releases/latest";
+/// GitHub Releases API URL for CLI distribution (hosted on the public launcher repo).
+/// CLI releases are tagged `cli-v*` to distinguish from launcher releases (`v*`).
+const CLI_RELEASES_URL: &str = "https://api.github.com/repos/Huitzo-Inc/huitzo-launcher/releases";
 
 /// Information about a CLI release, parsed from cli-release.json.
 #[derive(Debug)]
@@ -63,8 +64,20 @@ pub fn fetch_cli_release() -> Result<CliRelease, Error> {
         .read_to_string()
         .map_err(|e| Error::Network(format!("Failed to read release response: {e}")))?;
 
-    let release: serde_json::Value = serde_json::from_str(&body_str)
-        .map_err(|e| Error::Network(format!("Failed to parse release JSON: {e}")))?;
+    let releases: serde_json::Value = serde_json::from_str(&body_str)
+        .map_err(|e| Error::Network(format!("Failed to parse releases JSON: {e}")))?;
+
+    // Find the latest CLI release (tagged cli-v*)
+    let release = releases
+        .as_array()
+        .ok_or_else(|| Error::Network("No releases found".to_string()))?
+        .iter()
+        .find(|r| {
+            r["tag_name"]
+                .as_str()
+                .is_some_and(|t| t.starts_with("cli-v"))
+        })
+        .ok_or_else(|| Error::Network("No CLI release found (expected cli-v* tag)".to_string()))?;
 
     // Find cli-release.json asset
     let assets = release["assets"]
