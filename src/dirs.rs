@@ -30,6 +30,11 @@ pub fn manifest_path() -> PathBuf {
     huitzo_home().join("manifest.json")
 }
 
+/// Returns the user's home directory, panicking if unavailable.
+pub fn home_dir_or_panic() -> PathBuf {
+    dirs::home_dir().expect("Cannot determine home directory")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

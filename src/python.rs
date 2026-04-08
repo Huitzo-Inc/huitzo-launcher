@@ -21,21 +21,40 @@ const CANDIDATES: &[&str] = &[
 const MIN_MAJOR: u8 = 3;
 const MIN_MINOR: u8 = 11;
 
-/// Discover a Python 3.11+ interpreter on PATH.
+/// Discover all Python 3.11+ interpreters on PATH.
 ///
 /// Scans candidates in order, runs each to extract its version, and returns
-/// the first one that meets the minimum version requirement.
-pub fn discover() -> Result<PythonInfo, Error> {
+/// all that meet the minimum version requirement. The caller should iterate
+/// these and try each one (e.g., for venv creation) since some interpreters
+/// may be broken or incomplete (e.g., RC builds missing ensurepip).
+pub fn discover_all() -> Result<Vec<PythonInfo>, Error> {
+    let mut found = Vec::new();
+    let mut seen_paths = std::collections::HashSet::new();
+
     for candidate in CANDIDATES {
-        if let Ok(path) = which::which(candidate) {
-            if let Some(info) = probe_version(&path) {
-                if info.version.0 >= MIN_MAJOR && info.version.1 >= MIN_MINOR {
-                    return Ok(info);
+        // Use which_all to find ALL instances of each candidate in PATH,
+        // not just the first. This handles cases where uv/pyenv-managed
+        // Pythons shadow system Pythons in PATH order.
+        if let Ok(paths) = which::which_all(candidate) {
+            for path in paths {
+                // Deduplicate by canonical path
+                let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+                if !seen_paths.insert(canonical) {
+                    continue;
+                }
+                if let Some(info) = probe_version(&path) {
+                    if info.version.0 >= MIN_MAJOR && info.version.1 >= MIN_MINOR {
+                        found.push(info);
+                    }
                 }
             }
         }
     }
-    Err(Error::NoPython)
+    if found.is_empty() {
+        Err(Error::NoPython)
+    } else {
+        Ok(found)
+    }
 }
 
 /// Run the interpreter to extract its version.
@@ -73,13 +92,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn version_parsing_works() {
-        // If Python 3.11+ is available on this system, discover should succeed
-        // Otherwise this test is skipped implicitly (discover returns Err)
-        if let Ok(info) = discover() {
-            assert!(info.version.0 >= 3);
-            assert!(info.version.1 >= 11);
-            assert!(info.path.exists());
+    fn discover_all_returns_qualifying_candidates() {
+        // If Python 3.11+ is available on this system, discover_all should return at least one
+        if let Ok(candidates) = discover_all() {
+            assert!(!candidates.is_empty());
+            for info in &candidates {
+                assert!(info.version.0 >= 3);
+                assert!(info.version.1 >= 11);
+                assert!(info.path.exists());
+            }
         }
     }
 }

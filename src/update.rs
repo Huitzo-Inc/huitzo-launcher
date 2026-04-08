@@ -1,11 +1,9 @@
 use crate::dirs;
+use crate::download;
 use crate::errors::Error;
 use crate::manifest::{self, PendingUpdate};
 use sha2::{Digest, Sha256};
 use std::io::Read;
-
-/// PyPI JSON API URL for the huitzo package.
-const PYPI_URL: &str = "https://pypi.org/pypi/huitzo/json";
 
 /// GitHub Releases API URL for the launcher.
 const GITHUB_RELEASES_URL: &str =
@@ -17,7 +15,7 @@ pub fn should_skip() -> bool {
         .is_ok_and(|v| !v.is_empty() && v != "0" && v.to_lowercase() != "false")
 }
 
-/// Background update check: queries PyPI for a newer huitzo version.
+/// Background update check: queries GitHub Releases for a newer CLI version.
 ///
 /// Updates the manifest with the check timestamp and any pending update.
 /// Errors are silently ignored (non-blocking).
@@ -26,16 +24,16 @@ pub fn background_check() {
         return;
     };
 
-    // Check PyPI for newer Python package
-    if let Some(latest) = check_pypi_version() {
+    // Check GitHub Releases for newer compiled CLI wheel
+    if let Some(latest) = download::check_cli_release_version() {
         if version_is_newer(&latest, &m.huitzo_version) {
             eprintln!(
                 "huitzo {latest} is available (installed: {}). \
-                 Run 'huitzo --launcher-bootstrap' to update.",
+                 Update will apply on next launch.",
                 m.huitzo_version
             );
             m.pending_update = Some(PendingUpdate {
-                kind: "pip".to_string(),
+                kind: "wheel".to_string(),
                 version: latest,
             });
         }
@@ -43,19 +41,6 @@ pub fn background_check() {
 
     m.last_update_check = manifest::now_secs();
     let _ = manifest::save(&m);
-}
-
-/// Query PyPI JSON API for the latest version of the huitzo package.
-fn check_pypi_version() -> Option<String> {
-    let mut response = ureq::get(PYPI_URL).call().ok()?;
-
-    let body_str = response.body_mut().read_to_string().ok()?;
-
-    let body: serde_json::Value = serde_json::from_str(&body_str).ok()?;
-
-    body["info"]["version"]
-        .as_str()
-        .map(|s: &str| s.to_string())
 }
 
 /// Returns the platform-specific asset name for the current target triple.
