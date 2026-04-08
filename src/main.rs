@@ -75,18 +75,30 @@ fn run(args: Vec<String>) {
     // 5. Apply pending update if flagged
     if let Some(ref m) = manifest {
         if let Some(ref pending) = m.pending_update {
-            if pending.kind == "pip" {
-                eprintln!("Updating huitzo to {}...", pending.version);
-                let index_url = std::env::var("HUITZO_INDEX_URL").ok();
-                if install::install_package("huitzo", index_url.as_deref()).is_ok() {
-                    // Clear pending update
-                    let mut updated = manifest::load().unwrap_or_else(|| m.clone_for_update());
-                    updated.pending_update = None;
-                    if let Ok(Some(v)) = install::get_installed_version("huitzo") {
-                        updated.huitzo_version = v;
+            let install_ok = match pending.kind.as_str() {
+                "wheel" => {
+                    if let Some(ref url) = pending.url {
+                        eprintln!("Updating huitzo to {}...", pending.version);
+                        install::install_package_from_url(url).is_ok()
+                    } else {
+                        false
                     }
-                    let _ = manifest::save(&updated);
                 }
+                // Legacy "pip" kind — kept for manifests written by older launcher versions
+                "pip" => {
+                    eprintln!("Updating huitzo to {}...", pending.version);
+                    let index_url = std::env::var("HUITZO_INDEX_URL").ok();
+                    install::install_package("huitzo", index_url.as_deref()).is_ok()
+                }
+                _ => false,
+            };
+            if install_ok {
+                let mut updated = manifest::load().unwrap_or_else(|| m.clone_for_update());
+                updated.pending_update = None;
+                if let Ok(Some(v)) = install::get_installed_version("huitzo") {
+                    updated.huitzo_version = v;
+                }
+                let _ = manifest::save(&updated);
             }
         }
     }
@@ -120,10 +132,15 @@ fn bootstrap() -> Result<(), Error> {
     eprintln!("  Creating virtual environment...");
     venv::create(&py.path)?;
 
-    // Install huitzo from PyPI (or HUITZO_INDEX_URL for TestPyPI)
-    let index_url = std::env::var("HUITZO_INDEX_URL").ok();
+    // Install huitzo from GitHub releases (compiled wheel for this platform)
     eprintln!("  Installing huitzo...");
-    install::install_package("huitzo", index_url.as_deref())?;
+    if let Some((_version, wheel_url)) = update::fetch_latest_cli_release() {
+        install::install_package_from_url(&wheel_url)?;
+    } else {
+        // Fallback: install by package name (works if HUITZO_INDEX_URL is set)
+        let index_url = std::env::var("HUITZO_INDEX_URL").ok();
+        install::install_package("huitzo", index_url.as_deref())?;
+    }
 
     // Write manifest
     let version =

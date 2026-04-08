@@ -10,10 +10,13 @@ const UPDATE_CHECK_INTERVAL_SECS: u64 = 24 * 60 * 60; // 24 hours
 /// Pending update staged for next launch.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PendingUpdate {
-    /// "pip" for Python package, "launcher" for binary self-update.
+    /// "wheel" for GitHub-hosted wheel, "pip" (legacy) for PyPI package.
     pub kind: String,
     /// Target version.
     pub version: String,
+    /// Wheel download URL (set when kind == "wheel").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
 /// Launcher state persisted at `~/.huitzo/manifest.json`.
@@ -133,5 +136,31 @@ mod tests {
             created_at: 0,
         };
         assert!(!needs_update_check(&manifest));
+    }
+
+    #[test]
+    fn pending_update_url_round_trip() {
+        let manifest = Manifest {
+            schema_version: 1,
+            python_path: String::new(),
+            python_version: String::new(),
+            huitzo_version: "0.2.0".to_string(),
+            launcher_version: String::new(),
+            last_update_check: 0,
+            pending_update: Some(PendingUpdate {
+                kind: "wheel".to_string(),
+                version: "0.2.1".to_string(),
+                url: Some("https://github.com/example/releases/download/cli-v0.2.1/huitzo.whl".to_string()),
+            }),
+            created_at: 0,
+        };
+        let json = serde_json::to_string(&manifest).unwrap();
+        let parsed: Manifest = serde_json::from_str(&json).unwrap();
+        let update = parsed.pending_update.unwrap();
+        assert_eq!(update.kind, "wheel");
+        assert_eq!(
+            update.url.unwrap(),
+            "https://github.com/example/releases/download/cli-v0.2.1/huitzo.whl"
+        );
     }
 }

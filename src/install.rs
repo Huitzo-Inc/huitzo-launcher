@@ -27,6 +27,24 @@ pub fn install_package(package: &str, index_url: Option<&str>) -> Result<(), Err
     Ok(())
 }
 
+/// Install a wheel directly from a URL in the managed venv via pip.
+///
+/// Used for GitHub-hosted compiled wheels distributed via cli-release.json.
+pub fn install_package_from_url(url: &str) -> Result<(), Error> {
+    let python = dirs::venv_python();
+    let output = Command::new(&python)
+        .args(["-m", "pip", "install", "--upgrade", "--quiet", url])
+        .output()
+        .map_err(|e| Error::PipInstall(format!("Failed to run pip: {e}")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(Error::PipInstall(stderr.to_string()));
+    }
+
+    Ok(())
+}
+
 /// Get the installed version of a package in the managed venv.
 ///
 /// Returns `None` if the package is not installed.
