@@ -79,8 +79,10 @@ fn run(args: Vec<String>) {
             eprintln!("Updating huitzo to {}...", pending.version);
             let update_ok = match pending.kind.as_str() {
                 "wheel" => {
-                    // Download compiled wheel from GitHub Releases
-                    apply_wheel_update().is_ok()
+                    // Download compiled wheel from GitHub Releases.
+                    // Pass the Python version so ABI-keyed manifests resolve correctly.
+                    let pv = parse_python_version(&m.python_version);
+                    apply_wheel_update(pv).is_ok()
                 }
                 "pip" => {
                     // Legacy: install from PyPI (for manifests created before binary distribution)
@@ -165,7 +167,7 @@ fn bootstrap() -> Result<(), Error> {
 
     // Install huitzo: try compiled wheel from GitHub Releases, fall back to PyPI
     eprintln!("  Installing huitzo...");
-    if let Err(wheel_err) = install_from_release() {
+    if let Err(wheel_err) = install_from_release(Some(py.version)) {
         // Fallback to PyPI for backwards compatibility
         eprintln!("  Compiled wheel unavailable ({wheel_err}), falling back to PyPI...");
         let index_url = std::env::var("HUITZO_INDEX_URL").ok();
@@ -200,47 +202,28 @@ fn bootstrap() -> Result<(), Error> {
 }
 
 /// Download and install the latest compiled CLI wheel from GitHub Releases.
-fn install_from_release() -> Result<(), Error> {
+///
+/// `python_version` is used for ABI-specific key lookup (e.g. `macos-arm64-cp313`).
+/// Pass `None` only when the Python version is not known.
+fn install_from_release(python_version: Option<(u8, u8)>) -> Result<(), Error> {
     let release = download::fetch_cli_release()?;
-    let python_ver = venv_python_version();
-    let wheel = download::find_platform_wheel(&release, python_ver)?;
+    let wheel = download::find_platform_wheel(&release, python_version)?;
     let wheel_path = download::download_wheel(&release.version, wheel)?;
     install::install_wheel(&wheel_path)?;
     Ok(())
 }
 
-/// Detect the Python major.minor version running inside the managed venv.
-///
-/// Returns None if the venv doesn't exist yet or the version cannot be parsed.
-/// Used to select the matching compiled wheel (e.g. cp312 vs cp313).
-fn venv_python_version() -> Option<(u8, u8)> {
-    let python = dirs::venv_python();
-    if !python.exists() {
-        return None;
-    }
-    let output = std::process::Command::new(&python)
-        .args([
-            "-c",
-            "import sys; print(sys.version_info.major, sys.version_info.minor)",
-        ])
-        .output()
-        .ok()?;
-    let s = String::from_utf8(output.stdout).ok()?;
-    let parts: Vec<u8> = s
-        .trim()
-        .split_whitespace()
-        .filter_map(|p| p.parse().ok())
-        .collect();
-    if parts.len() == 2 {
-        Some((parts[0], parts[1]))
-    } else {
-        None
-    }
+/// Apply a pending wheel update from GitHub Releases.
+fn apply_wheel_update(python_version: Option<(u8, u8)>) -> Result<(), Error> {
+    install_from_release(python_version)
 }
 
-/// Apply a pending wheel update from GitHub Releases.
-fn apply_wheel_update() -> Result<(), Error> {
-    install_from_release()
+/// Parse a Python version string like "3.13" into `(major, minor)`.
+fn parse_python_version(s: &str) -> Option<(u8, u8)> {
+    let mut parts = s.split('.');
+    let major: u8 = parts.next()?.parse().ok()?;
+    let minor: u8 = parts.next()?.parse().ok()?;
+    Some((major, minor))
 }
 
 /// Check common locations for a pip-installed `huitzo` script that would

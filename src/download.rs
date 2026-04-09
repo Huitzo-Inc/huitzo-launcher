@@ -141,39 +141,35 @@ pub fn fetch_cli_release() -> Result<CliRelease, Error> {
 
 /// Find the best matching wheel for the current platform and Python version.
 ///
-/// Selection order:
-///   1. `{platform}-cp{major}{minor}` — exact Python version match (e.g. "macos-arm64-cp313")
-///   2. `{platform}` — version-agnostic fallback for older manifests
+/// Lookup order:
+/// 1. `{platform}-cp{major}{minor}` — exact interpreter ABI match (e.g. `macos-arm64-cp313`)
+/// 2. `{platform}` — version-agnostic fallback for older manifests or universal wheels
 ///
-/// This allows cli-release.json to carry wheels for multiple Python versions
-/// while remaining backwards compatible with launchers that only emit
-/// platform-only keys.
+/// Pass `python_version` as `Some((major, minor))` when the interpreter version is known.
+/// Pass `None` only as a last resort.
 pub fn find_platform_wheel<'a>(
     release: &'a CliRelease,
     python_version: Option<(u8, u8)>,
 ) -> Result<&'a WheelInfo, Error> {
     let platform = current_platform();
 
-    // 1. Try Python-version-specific key (e.g., "macos-arm64-cp313")
+    // 1. Try Python-version-specific key (e.g. "macos-arm64-cp313")
     if let Some((major, minor)) = python_version {
-        let versioned_key = format!("{platform}-cp{major}{minor}");
-        if let Some(wheel) = release
-            .wheels
-            .iter()
-            .find(|w| w.platform_key == versioned_key)
-        {
+        let abi_key = format!("{platform}-cp{major}{minor}");
+        if let Some(wheel) = release.wheels.iter().find(|w| w.platform_key == abi_key) {
             return Ok(wheel);
         }
     }
 
-    // 2. Fall back to platform-only key (backwards compatibility with old manifests)
+    // 2. Fall back to platform-only key for backwards compatibility
     release
         .wheels
         .iter()
         .find(|w| w.platform_key == platform)
         .ok_or_else(|| {
             Error::PipInstall(format!(
-                "No compiled wheel for platform '{platform}'. Available: {}",
+                "No compiled wheel for platform '{platform}' (python {:?}). Available: {}",
+                python_version,
                 release
                     .wheels
                     .iter()
@@ -260,6 +256,21 @@ pub fn check_cli_release_version() -> Option<String> {
 mod tests {
     use super::*;
 
+    fn make_release(keys: &[&str]) -> CliRelease {
+        CliRelease {
+            version: "0.2.3".to_string(),
+            min_launcher_version: "0.1.0".to_string(),
+            wheels: keys
+                .iter()
+                .map(|k| WheelInfo {
+                    platform_key: k.to_string(),
+                    filename: format!("huitzo-0.2.3-{k}.whl"),
+                    sha256: "abc".to_string(),
+                })
+                .collect(),
+        }
+    }
+
     #[test]
     fn current_platform_returns_valid_key() {
         let platform = current_platform();
@@ -277,48 +288,64 @@ mod tests {
     }
 
     #[test]
-    fn find_platform_wheel_prefers_versioned_key() {
-        let release = CliRelease {
-            version: "0.2.3".to_string(),
-            min_launcher_version: "0.2.0".to_string(),
-            wheels: vec![
-                WheelInfo {
-                    platform_key: "macos-arm64-cp312".to_string(),
-                    filename: "huitzo-0.2.3-cp312-cp312-macosx_11_0_arm64.whl".to_string(),
-                    sha256: "abc".to_string(),
-                },
-                WheelInfo {
-                    platform_key: "macos-arm64-cp313".to_string(),
-                    filename: "huitzo-0.2.3-cp313-cp313-macosx_11_0_arm64.whl".to_string(),
-                    sha256: "def".to_string(),
-                },
-            ],
-        };
+    fn find_platform_wheel_prefers_abi_key() {
+        let platform = current_platform();
+        let abi_key = format!("{platform}-cp313");
+        let release = make_release(&[&abi_key, platform]);
 
-        // Simulate macOS arm64 + Python 3.13 (override current_platform via key matching)
-        let wheel = release
-            .wheels
-            .iter()
-            .find(|w| w.platform_key == "macos-arm64-cp313")
-            .unwrap();
-        assert!(wheel.filename.contains("cp313"));
+        let wheel = find_platform_wheel(&release, Some((3, 13))).unwrap();
+        assert_eq!(wheel.platform_key, abi_key, "Should prefer ABI-specific key");
     }
 
     #[test]
     fn find_platform_wheel_falls_back_to_platform_key() {
-        let release = CliRelease {
-            version: "0.2.2".to_string(),
-            min_launcher_version: "0.2.0".to_string(),
-            wheels: vec![WheelInfo {
-                platform_key: "linux-x86_64".to_string(),
-                filename: "huitzo-0.2.2-cp312-cp312-manylinux_x86_64.whl".to_string(),
-                sha256: "abc".to_string(),
-            }],
-        };
-        // No version-specific key → falls back to platform key
-        let result = find_platform_wheel(&release, Some((3, 13)));
-        // On linux-x86_64 CI this will succeed; on other platforms it will fail.
-        // Just verify the function doesn't panic.
-        let _ = result;
+        let platform = current_platform();
+        let release = make_release(&[platform]);
+
+        let wheel = find_platform_wheel(&release, Some((3, 13))).unwrap();
+        assert_eq!(wheel.platform_key, platform);
+    }
+
+    #[test]
+    fn find_platform_wheel_abi_only_manifest() {
+        let platform = current_platform();
+        let abi_key = format!("{platform}-cp311");
+        let release = make_release(&[&abi_key]);
+
+        let wheel = find_platform_wheel(&release, Some((3, 11))).unwrap();
+        assert_eq!(wheel.platform_key, abi_key);
+    }
+
+    #[test]
+    fn find_platform_wheel_abi_mismatch_falls_back() {
+        let platform = current_platform();
+        let abi_key = format!("{platform}-cp311");
+        let release = make_release(&[&abi_key, platform]);
+
+        let wheel = find_platform_wheel(&release, Some((3, 13))).unwrap();
+        assert_eq!(wheel.platform_key, platform, "cp313 miss → fall back to base key");
+    }
+
+    #[test]
+    fn find_platform_wheel_no_python_version_uses_platform_key() {
+        let platform = current_platform();
+        let release = make_release(&[platform]);
+
+        let wheel = find_platform_wheel(&release, None).unwrap();
+        assert_eq!(wheel.platform_key, platform);
+    }
+
+    #[test]
+    fn find_platform_wheel_returns_error_when_no_match() {
+        let release = make_release(&["linux-x86_64-cp310"]);
+        let platform = current_platform();
+        let abi_key = format!("{platform}-cp310");
+        if release
+            .wheels
+            .iter()
+            .all(|w| w.platform_key != platform && w.platform_key != abi_key)
+        {
+            assert!(find_platform_wheel(&release, Some((3, 13))).is_err());
+        }
     }
 }
