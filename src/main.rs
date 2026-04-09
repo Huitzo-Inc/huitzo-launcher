@@ -202,10 +202,40 @@ fn bootstrap() -> Result<(), Error> {
 /// Download and install the latest compiled CLI wheel from GitHub Releases.
 fn install_from_release() -> Result<(), Error> {
     let release = download::fetch_cli_release()?;
-    let wheel = download::find_platform_wheel(&release)?;
+    let python_ver = venv_python_version();
+    let wheel = download::find_platform_wheel(&release, python_ver)?;
     let wheel_path = download::download_wheel(&release.version, wheel)?;
     install::install_wheel(&wheel_path)?;
     Ok(())
+}
+
+/// Detect the Python major.minor version running inside the managed venv.
+///
+/// Returns None if the venv doesn't exist yet or the version cannot be parsed.
+/// Used to select the matching compiled wheel (e.g. cp312 vs cp313).
+fn venv_python_version() -> Option<(u8, u8)> {
+    let python = dirs::venv_python();
+    if !python.exists() {
+        return None;
+    }
+    let output = std::process::Command::new(&python)
+        .args([
+            "-c",
+            "import sys; print(sys.version_info.major, sys.version_info.minor)",
+        ])
+        .output()
+        .ok()?;
+    let s = String::from_utf8(output.stdout).ok()?;
+    let parts: Vec<u8> = s
+        .trim()
+        .split_whitespace()
+        .filter_map(|p| p.parse().ok())
+        .collect();
+    if parts.len() == 2 {
+        Some((parts[0], parts[1]))
+    } else {
+        None
+    }
 }
 
 /// Apply a pending wheel update from GitHub Releases.
