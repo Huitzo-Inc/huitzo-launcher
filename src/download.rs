@@ -157,7 +157,11 @@ pub fn find_platform_wheel<'a>(
     // 1. Try Python-version-specific key (e.g., "macos-arm64-cp313")
     if let Some((major, minor)) = python_version {
         let versioned_key = format!("{platform}-cp{major}{minor}");
-        if let Some(wheel) = release.wheels.iter().find(|w| w.platform_key == versioned_key) {
+        if let Some(wheel) = release
+            .wheels
+            .iter()
+            .find(|w| w.platform_key == versioned_key)
+        {
             return Ok(wheel);
         }
     }
