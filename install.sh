@@ -1,20 +1,33 @@
 #!/bin/sh
-# Huitzo CLI Launcher Installer
+# Huitzo CLI Installer — Linux & macOS
 # Usage: curl -sSf https://raw.githubusercontent.com/Huitzo-Inc/huitzo-launcher/main/install.sh | sh
+#
+# Environment variables:
+#   HUITZO_HOME            — override install root (default: ~/.huitzo)
+#   HUITZO_NO_MODIFY_PATH  — set to 1 to skip shell profile modification
 set -eu
 
 REPO="Huitzo-Inc/huitzo-launcher"
-INSTALL_DIR="${HUITZO_HOME:-$HOME/.huitzo}/bin"
+HUITZO_HOME="${HUITZO_HOME:-$HOME/.huitzo}"
+INSTALL_DIR="$HUITZO_HOME/bin"
+VENV_DIR="$HUITZO_HOME/venv"
+CACHE_DIR="$HUITZO_HOME/cache"
 
 main() {
+    echo "==> Installing Huitzo CLI"
     detect_platform
     fetch_latest_version
-    download_binary
+    clean_conflicts
+    download_and_verify
     install_binary
-    add_to_path
+    modify_path
+
     echo ""
-    echo "Huitzo CLI launcher installed to: $INSTALL_DIR/huitzo"
-    echo "Run 'huitzo --launcher-version' to verify."
+    echo "✓ Huitzo CLI installed to: $INSTALL_DIR/huitzo"
+    echo ""
+    echo "Run 'huitzo --version' to get started."
+    echo "If 'huitzo' is not found, restart your shell or run:"
+    echo "  export PATH=\"$INSTALL_DIR:\$PATH\""
 }
 
 detect_platform() {
@@ -24,72 +37,134 @@ detect_platform() {
     case "$OS" in
         linux)  OS_TARGET="unknown-linux-musl" ;;
         darwin) OS_TARGET="apple-darwin" ;;
-        *)      echo "Error: Unsupported OS: $OS"; exit 1 ;;
+        *) echo "Error: Unsupported OS: $OS"; exit 1 ;;
     esac
 
     case "$ARCH" in
         x86_64|amd64)  ARCH_TARGET="x86_64" ;;
         aarch64|arm64) ARCH_TARGET="aarch64" ;;
-        *)             echo "Error: Unsupported architecture: $ARCH"; exit 1 ;;
+        *) echo "Error: Unsupported architecture: $ARCH"; exit 1 ;;
     esac
 
     ASSET="huitzo-${ARCH_TARGET}-${OS_TARGET}"
-    echo "Platform: ${ARCH_TARGET}-${OS_TARGET}"
+    echo "  Platform: ${ARCH_TARGET}-${OS_TARGET}"
 }
 
 fetch_latest_version() {
-    echo "Fetching latest release..."
-    RELEASE_URL="https://api.github.com/repos/$REPO/releases/latest"
-    DOWNLOAD_URL=$(curl -sSf "$RELEASE_URL" | grep "browser_download_url.*$ASSET\"" | head -1 | cut -d '"' -f 4)
+    echo "  Fetching latest release..."
+    API_RESPONSE=$(curl -sSf "https://api.github.com/repos/$REPO/releases/latest")
+    DOWNLOAD_URL=$(echo "$API_RESPONSE" | grep "browser_download_url.*${ASSET}\"" | head -1 | cut -d '"' -f 4)
+    SHA256_URL=$(echo "$API_RESPONSE" | grep "browser_download_url.*${ASSET}.sha256\"" | head -1 | cut -d '"' -f 4)
 
     if [ -z "$DOWNLOAD_URL" ]; then
         echo "Error: Could not find binary for $ASSET"
-        echo "Check releases at: https://github.com/$REPO/releases"
+        echo "Check: https://github.com/$REPO/releases"
         exit 1
     fi
+
+    VERSION=$(echo "$API_RESPONSE" | grep '"tag_name"' | head -1 | cut -d '"' -f 4)
+    echo "  Version: $VERSION"
 }
 
-download_binary() {
+clean_conflicts() {
+    # Remove launcher-managed venv so the new binary performs a fresh CLI install
+    if [ -d "$VENV_DIR" ]; then
+        echo "  Removing old launcher venv..."
+        rm -rf "$VENV_DIR"
+    fi
+
+    # Remove cached wheels so the launcher re-fetches the current release
+    if [ -d "$CACHE_DIR" ]; then
+        echo "  Clearing wheel cache..."
+        rm -rf "$CACHE_DIR"
+    fi
+
+    # Remove any conflicting pip-installed huitzo
+    for pip_cmd in pip3 pip; do
+        if command -v "$pip_cmd" > /dev/null 2>&1; then
+            if "$pip_cmd" show huitzo > /dev/null 2>&1; then
+                echo "  Removing conflicting pip-installed huitzo..."
+                "$pip_cmd" uninstall huitzo -y --quiet 2>/dev/null || true
+                echo "  Done."
+            fi
+            break
+        fi
+    done
+}
+
+download_and_verify() {
     TMPDIR=$(mktemp -d)
-    echo "Downloading $ASSET..."
-    curl -sSfL "$DOWNLOAD_URL" -o "$TMPDIR/huitzo"
-    chmod +x "$TMPDIR/huitzo"
+    trap 'rm -rf "$TMPDIR"' EXIT
+    TMPBIN="$TMPDIR/huitzo"
+
+    echo "  Downloading $ASSET..."
+    curl -sSfL "$DOWNLOAD_URL" -o "$TMPBIN"
+
+    if [ -n "${SHA256_URL:-}" ]; then
+        echo "  Verifying checksum..."
+        EXPECTED=$(curl -sSfL "$SHA256_URL" | awk '{print $1}')
+
+        if command -v sha256sum > /dev/null 2>&1; then
+            ACTUAL=$(sha256sum "$TMPBIN" | awk '{print $1}')
+        elif command -v shasum > /dev/null 2>&1; then
+            ACTUAL=$(shasum -a 256 "$TMPBIN" | awk '{print $1}')
+        else
+            echo "  Warning: No sha256 tool found, skipping verification."
+            ACTUAL="$EXPECTED"
+        fi
+
+        if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "Error: Checksum mismatch — download may be corrupted."
+            echo "  Expected: $EXPECTED"
+            echo "  Got:      $ACTUAL"
+            exit 1
+        fi
+        echo "  Checksum OK"
+    fi
+
+    chmod +x "$TMPBIN"
+    VERIFIED_BIN="$TMPBIN"
 }
 
 install_binary() {
     mkdir -p "$INSTALL_DIR"
-    mv "$TMPDIR/huitzo" "$INSTALL_DIR/huitzo"
-    rm -rf "$TMPDIR"
+
+    if [ -f "$INSTALL_DIR/huitzo" ]; then
+        echo "  Replacing existing launcher binary..."
+    fi
+
+    cp "$VERIFIED_BIN" "$INSTALL_DIR/huitzo"
+    echo "  Installed → $INSTALL_DIR/huitzo"
 }
 
-add_to_path() {
-    case "$INSTALL_DIR" in
-        */.huitzo/bin)
-            # Add to PATH if not already there
-            if ! echo "$PATH" | grep -q "$INSTALL_DIR"; then
-                SHELL_NAME=$(basename "${SHELL:-/bin/sh}")
-                case "$SHELL_NAME" in
-                    zsh)  RC="$HOME/.zshrc" ;;
-                    bash) RC="$HOME/.bashrc" ;;
-                    fish) RC="$HOME/.config/fish/config.fish" ;;
-                    *)    RC="" ;;
-                esac
+modify_path() {
+    [ "${HUITZO_NO_MODIFY_PATH:-0}" = "1" ] && return
 
-                if [ -n "$RC" ] && [ -f "$RC" ]; then
-                    if ! grep -q "$INSTALL_DIR" "$RC" 2>/dev/null; then
-                        echo "" >> "$RC"
-                        echo "# Huitzo CLI" >> "$RC"
-                        echo "export PATH=\"$INSTALL_DIR:\$PATH\"" >> "$RC"
-                        echo "Added $INSTALL_DIR to PATH in $RC"
-                        echo "Run 'source $RC' or restart your shell."
-                    fi
-                else
-                    echo "Add this to your shell profile:"
-                    echo "  export PATH=\"$INSTALL_DIR:\$PATH\""
-                fi
-            fi
+    echo "$PATH" | tr ':' '\n' | grep -qxF "$INSTALL_DIR" && return
+
+    SHELL_NAME=$(basename "${SHELL:-/bin/sh}")
+    case "$SHELL_NAME" in
+        zsh)  RC="$HOME/.zshrc" ;;
+        bash)
+            RC="$HOME/.bashrc"
+            [ "$(uname -s)" = "Darwin" ] && RC="$HOME/.bash_profile"
             ;;
+        fish) RC="$HOME/.config/fish/config.fish" ;;
+        *)    RC="" ;;
     esac
+
+    EXPORT_LINE="export PATH=\"$INSTALL_DIR:\$PATH\""
+
+    if [ -n "$RC" ]; then
+        if ! grep -qF "$INSTALL_DIR" "$RC" 2>/dev/null; then
+            printf '\n# Huitzo CLI\n%s\n' "$EXPORT_LINE" >> "$RC"
+            echo "  Added PATH entry to $RC"
+            echo "  Run: source $RC   (or restart your shell)"
+        fi
+    else
+        echo "  Add this to your shell profile:"
+        echo "    $EXPORT_LINE"
+    fi
 }
 
 main
