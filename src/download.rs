@@ -152,6 +152,10 @@ pub fn has_wheel_for(release: &CliRelease, python_version: (u8, u8)) -> bool {
 /// 1. `{platform}-cp{major}{minor}` — exact interpreter ABI match (e.g. `macos-arm64-cp313`)
 /// 2. `{platform}` — version-agnostic fallback for older manifests or universal wheels
 ///
+/// This allows cli-release.json to carry wheels for multiple Python versions
+/// while remaining backwards compatible with launchers that only emit
+/// platform-only keys.
+///
 /// Pass `python_version` as `Some((major, minor))` when the interpreter version is known.
 /// Pass `None` only as a last resort.
 pub fn find_platform_wheel(
