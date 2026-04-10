@@ -17,7 +17,7 @@ The launcher is a lightweight Rust binary (~3-5 MB) that:
 ### Homebrew (macOS)
 
 ```sh
-brew install huitzo/tap/huitzo
+brew install Huitzo-Inc/tap/huitzo
 ```
 
 ### curl (Linux / macOS)
