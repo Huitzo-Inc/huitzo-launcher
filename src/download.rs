@@ -238,7 +238,11 @@ pub fn download_wheel(release_version: &str, wheel: &WheelInfo) -> Result<PathBu
     }
 
     // Verify checksum
-    let computed = format!("{:x}", hasher.finalize());
+    let computed: String = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
     if computed != wheel.sha256 {
         let _ = std::fs::remove_file(&dest);
         return Err(Error::PipInstall(format!(
