@@ -111,68 +111,52 @@ fn run(args: Vec<String>) {
 
 /// Bootstrap: discover Python, create venv, install huitzo, write manifest.
 ///
-/// Iterates all discovered Python 3.11+ interpreters, trying each for venv
-/// creation. This handles broken interpreters (e.g., RC builds with missing
-/// ensurepip) by falling back to the next candidate.
+/// Fetches the release manifest once upfront, then iterates all discovered
+/// Python 3.11+ interpreters in two passes:
+///   Pass 1 — prefer a Python that has a compiled wheel in the manifest.
+///   Pass 2 — if no wheel-compatible Python creates a venv successfully,
+///             fall back to the first working Python (will install from PyPI).
+///
+/// This avoids committing to Python 3.14 (for example) when only cp312/cp313
+/// wheels exist and Python 3.12 is also available.
 fn bootstrap() -> Result<(), Error> {
     eprintln!("Setting up huitzo environment...");
 
     let candidates = python::discover_all()?;
 
-    let mut last_err = None;
-    let mut py_used = None;
+    // Fetch the release manifest once — used to score Python candidates.
+    // Network failure is non-fatal here; we degrade to PyPI fallback.
+    let release = download::fetch_cli_release().ok();
 
-    for py in &candidates {
-        eprintln!(
-            "  Trying Python {}.{} at {}",
-            py.version.0,
-            py.version.1,
-            py.path.display()
-        );
-
-        // Destroy stale venv if it exists
-        let venv_dir = dirs::venv_dir();
-        if venv_dir.exists() {
-            venv::destroy()?;
-        }
-
-        // Attempt venv creation
-        match venv::create(&py.path) {
-            Ok(()) => {
-                py_used = Some(py);
-                break;
-            }
-            Err(e) => {
-                eprintln!(
-                    "  Warning: Python {}.{} failed to create venv, trying next...",
-                    py.version.0, py.version.1
-                );
-                last_err = Some(e);
-            }
-        }
-    }
-
-    let py = py_used.ok_or_else(|| {
-        last_err.unwrap_or_else(|| {
-            Error::VenvCreate("All Python candidates failed to create a virtual environment".into())
-        })
-    })?;
+    let py_used = select_python(&candidates, release.as_ref())?;
 
     eprintln!(
         "  Using Python {}.{} at {}",
-        py.version.0,
-        py.version.1,
-        py.path.display()
+        py_used.version.0,
+        py_used.version.1,
+        py_used.path.display()
     );
 
-    // Install huitzo: try compiled wheel from GitHub Releases, fall back to PyPI
+    // Install huitzo: try compiled wheel from the already-fetched release, fall back to PyPI
     eprintln!("  Installing huitzo...");
-    if let Err(wheel_err) = install_from_release(Some(py.version)) {
-        // Fallback to PyPI for backwards compatibility
-        eprintln!("  Compiled wheel unavailable ({wheel_err}), falling back to PyPI...");
+    let installed_from_wheel = if let Some(ref rel) = release {
+        match install_from_fetched_release(rel, Some(py_used.version)) {
+            Ok(()) => true,
+            Err(wheel_err) => {
+                eprintln!("  Compiled wheel unavailable ({wheel_err}), falling back to PyPI...");
+                let index_url = std::env::var("HUITZO_INDEX_URL").ok();
+                install::install_package("huitzo", index_url.as_deref())?;
+                false
+            }
+        }
+    } else {
+        // Release fetch failed earlier — go straight to PyPI
+        eprintln!("  Release manifest unavailable, falling back to PyPI...");
         let index_url = std::env::var("HUITZO_INDEX_URL").ok();
         install::install_package("huitzo", index_url.as_deref())?;
-    }
+        false
+    };
+    let _ = installed_from_wheel; // used implicitly via detect_install_source()
 
     // Write manifest
     let version =
@@ -187,8 +171,8 @@ fn bootstrap() -> Result<(), Error> {
 
     manifest::save(&Manifest {
         schema_version: 2,
-        python_path: py.path.to_string_lossy().to_string(),
-        python_version: format!("{}.{}", py.version.0, py.version.1),
+        python_path: py_used.path.to_string_lossy().to_string(),
+        python_version: format!("{}.{}", py_used.version.0, py_used.version.1),
         huitzo_version: version,
         launcher_version: env!("CARGO_PKG_VERSION").to_string(),
         last_update_check: 0, // Force update check on next run
@@ -201,13 +185,93 @@ fn bootstrap() -> Result<(), Error> {
     Ok(())
 }
 
-/// Download and install the latest compiled CLI wheel from GitHub Releases.
+/// Select the best Python interpreter from `candidates` for the managed venv.
+///
+/// Pass 1: prefer a Python that both creates a venv successfully AND has a
+///         compiled wheel in `release` (if provided).
+/// Pass 2: if pass 1 yields nothing, accept the first Python that creates a
+///         venv — wheel-less fallback will use PyPI.
+fn select_python<'a>(
+    candidates: &'a [python::PythonInfo],
+    release: Option<&download::CliRelease>,
+) -> Result<&'a python::PythonInfo, Error> {
+    // Pass 1: wheel-compatible Python preferred (skipped if no release manifest)
+    if let Some(rel) = release {
+        for py in candidates {
+            if !download::has_wheel_for(rel, py.version) {
+                continue;
+            }
+            if try_venv(py) {
+                return Ok(py);
+            }
+        }
+    }
+
+    // Pass 2: any working Python (will fall back to PyPI)
+    let mut last_err: Option<Error> = None;
+    for py in candidates {
+        eprintln!(
+            "  Trying Python {}.{} at {}",
+            py.version.0,
+            py.version.1,
+            py.path.display()
+        );
+        let venv_dir = dirs::venv_dir();
+        if venv_dir.exists() {
+            venv::destroy()?;
+        }
+        match venv::create(&py.path) {
+            Ok(()) => return Ok(py),
+            Err(e) => {
+                eprintln!(
+                    "  Warning: Python {}.{} failed to create venv, trying next...",
+                    py.version.0, py.version.1
+                );
+                last_err = Some(e);
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| {
+        Error::VenvCreate("All Python candidates failed to create a virtual environment".into())
+    }))
+}
+
+/// Attempt to create the managed venv using `py`. Returns true on success.
+///
+/// Destroys any existing venv first, prints progress, and silently returns
+/// false on failure (caller decides whether to warn or move on).
+fn try_venv(py: &python::PythonInfo) -> bool {
+    eprintln!(
+        "  Trying Python {}.{} at {} (has compiled wheel)",
+        py.version.0,
+        py.version.1,
+        py.path.display()
+    );
+    let venv_dir = dirs::venv_dir();
+    if venv_dir.exists() && venv::destroy().is_err() {
+        return false;
+    }
+    match venv::create(&py.path) {
+        Ok(()) => true,
+        Err(_) => {
+            eprintln!(
+                "  Warning: Python {}.{} failed to create venv, trying next...",
+                py.version.0, py.version.1
+            );
+            false
+        }
+    }
+}
+
+/// Download and install a compiled wheel from an already-fetched `CliRelease`.
 ///
 /// `python_version` is used for ABI-specific key lookup (e.g. `macos-arm64-cp313`).
-/// Pass `None` only when the Python version is not known.
-fn install_from_release(python_version: Option<(u8, u8)>) -> Result<(), Error> {
-    let release = download::fetch_cli_release()?;
-    let wheel = download::find_platform_wheel(&release, python_version)?;
+fn install_from_fetched_release(
+    release: &download::CliRelease,
+    python_version: Option<(u8, u8)>,
+) -> Result<(), Error> {
+    let wheel = download::find_platform_wheel(release, python_version)?;
     let wheel_path = download::download_wheel(&release.version, wheel)?;
     install::install_wheel(&wheel_path)?;
     Ok(())
@@ -215,7 +279,8 @@ fn install_from_release(python_version: Option<(u8, u8)>) -> Result<(), Error> {
 
 /// Apply a pending wheel update from GitHub Releases.
 fn apply_wheel_update(python_version: Option<(u8, u8)>) -> Result<(), Error> {
-    install_from_release(python_version)
+    let release = download::fetch_cli_release()?;
+    install_from_fetched_release(&release, python_version)
 }
 
 /// Parse a Python version string like "3.13" into `(major, minor)`.

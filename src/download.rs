@@ -139,6 +139,13 @@ pub fn fetch_cli_release() -> Result<CliRelease, Error> {
     })
 }
 
+/// Returns true if a compiled wheel exists for the given Python version on the current platform.
+///
+/// Used during Python selection in bootstrap to prefer interpreters that have a compiled wheel.
+pub fn has_wheel_for(release: &CliRelease, python_version: (u8, u8)) -> bool {
+    find_platform_wheel(release, Some(python_version)).is_ok()
+}
+
 /// Find the best matching wheel for the current platform and Python version.
 ///
 /// Lookup order:
