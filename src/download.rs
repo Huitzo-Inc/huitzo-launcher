@@ -152,12 +152,16 @@ pub fn has_wheel_for(release: &CliRelease, python_version: (u8, u8)) -> bool {
 /// 1. `{platform}-cp{major}{minor}` — exact interpreter ABI match (e.g. `macos-arm64-cp313`)
 /// 2. `{platform}` — version-agnostic fallback for older manifests or universal wheels
 ///
+/// This allows cli-release.json to carry wheels for multiple Python versions
+/// while remaining backwards compatible with launchers that only emit
+/// platform-only keys.
+///
 /// Pass `python_version` as `Some((major, minor))` when the interpreter version is known.
 /// Pass `None` only as a last resort.
-pub fn find_platform_wheel<'a>(
-    release: &'a CliRelease,
+pub fn find_platform_wheel(
+    release: &CliRelease,
     python_version: Option<(u8, u8)>,
-) -> Result<&'a WheelInfo, Error> {
+) -> Result<&WheelInfo, Error> {
     let platform = current_platform();
 
     // 1. Try Python-version-specific key (e.g. "macos-arm64-cp313")
@@ -238,7 +242,11 @@ pub fn download_wheel(release_version: &str, wheel: &WheelInfo) -> Result<PathBu
     }
 
     // Verify checksum
-    let computed = format!("{:x}", hasher.finalize());
+    let computed: String = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
     if computed != wheel.sha256 {
         let _ = std::fs::remove_file(&dest);
         return Err(Error::PipInstall(format!(
@@ -301,7 +309,10 @@ mod tests {
         let release = make_release(&[&abi_key, platform]);
 
         let wheel = find_platform_wheel(&release, Some((3, 13))).unwrap();
-        assert_eq!(wheel.platform_key, abi_key, "Should prefer ABI-specific key");
+        assert_eq!(
+            wheel.platform_key, abi_key,
+            "Should prefer ABI-specific key"
+        );
     }
 
     #[test]
@@ -330,7 +341,10 @@ mod tests {
         let release = make_release(&[&abi_key, platform]);
 
         let wheel = find_platform_wheel(&release, Some((3, 13))).unwrap();
-        assert_eq!(wheel.platform_key, platform, "cp313 miss → fall back to base key");
+        assert_eq!(
+            wheel.platform_key, platform,
+            "cp313 miss → fall back to base key"
+        );
     }
 
     #[test]

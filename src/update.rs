@@ -236,7 +236,7 @@ fn download_and_hash(url: &str, dest: &std::path::Path) -> Result<String, Error>
     }
 
     let hash = hasher.finalize();
-    Ok(format!("{hash:x}"))
+    Ok(hash.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// Simple version comparison: "0.2.0" > "0.1.7".
