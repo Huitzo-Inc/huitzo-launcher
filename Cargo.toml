@@ -16,7 +16,7 @@ dirs = "6"
 which = "7"
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.29", features = ["process"] }
+nix = { version = "0.31", features = ["process"] }
 
 [profile.release]
 opt-level = "z"
