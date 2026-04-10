@@ -154,10 +154,10 @@ pub fn has_wheel_for(release: &CliRelease, python_version: (u8, u8)) -> bool {
 ///
 /// Pass `python_version` as `Some((major, minor))` when the interpreter version is known.
 /// Pass `None` only as a last resort.
-pub fn find_platform_wheel<'a>(
-    release: &'a CliRelease,
+pub fn find_platform_wheel(
+    release: &CliRelease,
     python_version: Option<(u8, u8)>,
-) -> Result<&'a WheelInfo, Error> {
+) -> Result<&WheelInfo, Error> {
     let platform = current_platform();
 
     // 1. Try Python-version-specific key (e.g. "macos-arm64-cp313")
@@ -301,7 +301,10 @@ mod tests {
         let release = make_release(&[&abi_key, platform]);
 
         let wheel = find_platform_wheel(&release, Some((3, 13))).unwrap();
-        assert_eq!(wheel.platform_key, abi_key, "Should prefer ABI-specific key");
+        assert_eq!(
+            wheel.platform_key, abi_key,
+            "Should prefer ABI-specific key"
+        );
     }
 
     #[test]
@@ -330,7 +333,10 @@ mod tests {
         let release = make_release(&[&abi_key, platform]);
 
         let wheel = find_platform_wheel(&release, Some((3, 13))).unwrap();
-        assert_eq!(wheel.platform_key, platform, "cp313 miss → fall back to base key");
+        assert_eq!(
+            wheel.platform_key, platform,
+            "cp313 miss → fall back to base key"
+        );
     }
 
     #[test]
