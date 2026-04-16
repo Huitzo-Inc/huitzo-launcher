@@ -92,6 +92,9 @@ fn fetch_all_releases() -> Result<serde_json::Value, Error> {
 ///
 /// Launcher releases are tagged `v*` (e.g. `v0.2.3`).
 /// CLI releases are tagged `cli-v*` and are excluded.
+///
+/// GitHub's Releases API returns releases in reverse chronological order,
+/// so the first matching `v*` tag is the most recent launcher release.
 fn find_latest_launcher_version(releases: &serde_json::Value) -> Option<String> {
     let tag = releases
         .as_array()?
@@ -99,6 +102,8 @@ fn find_latest_launcher_version(releases: &serde_json::Value) -> Option<String> 
         .filter_map(|r| r["tag_name"].as_str())
         .find(|t| t.starts_with('v') && !t.starts_with("cli-v"))?;
 
+    // strip_prefix is guaranteed to succeed here (filter ensures 'v' prefix),
+    // but unwrap_or is kept as defensive fallback.
     Some(tag.strip_prefix('v').unwrap_or(tag).to_string())
 }
 
