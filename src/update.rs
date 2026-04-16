@@ -15,8 +15,9 @@ pub fn should_skip() -> bool {
         .is_ok_and(|v| !v.is_empty() && v != "0" && v.to_lowercase() != "false")
 }
 
-/// Background update check: queries GitHub Releases for a newer CLI version.
+/// Background update check: queries GitHub Releases for newer launcher and CLI versions.
 ///
+/// Checks the launcher first (higher priority), then the CLI.
 /// Updates the manifest with the check timestamp and any pending update.
 /// Errors are silently ignored (non-blocking).
 pub fn background_check() {
@@ -24,8 +25,19 @@ pub fn background_check() {
         return;
     };
 
-    // Check GitHub Releases for newer compiled CLI wheel
-    if let Some(latest) = download::check_cli_release_version() {
+    // Check for launcher self-update first (higher priority)
+    if let Some(latest) = check_launcher_version() {
+        eprintln!(
+            "huitzo-launcher {latest} is available (installed: {}). \
+             Update will apply on next launch.",
+            env!("CARGO_PKG_VERSION")
+        );
+        m.pending_update = Some(PendingUpdate {
+            kind: "launcher".to_string(),
+            version: latest,
+        });
+    } else if let Some(latest) = download::check_cli_release_version() {
+        // Only check CLI if launcher is already up-to-date
         if version_is_newer(&latest, &m.huitzo_version) {
             eprintln!(
                 "huitzo {latest} is available (installed: {}). \
@@ -41,6 +53,53 @@ pub fn background_check() {
 
     m.last_update_check = manifest::now_secs();
     let _ = manifest::save(&m);
+}
+
+/// Check if a newer launcher version is available on GitHub Releases.
+///
+/// Queries all releases and filters for launcher tags (`v*`, excluding `cli-v*`).
+/// Returns `Some(version)` if a newer version is available, `None` otherwise.
+fn check_launcher_version() -> Option<String> {
+    let releases = fetch_all_releases().ok()?;
+    let latest = find_latest_launcher_version(&releases)?;
+    let current = env!("CARGO_PKG_VERSION");
+    if version_is_newer(&latest, current) {
+        Some(latest)
+    } else {
+        None
+    }
+}
+
+/// Fetch all releases from GitHub Releases API.
+fn fetch_all_releases() -> Result<serde_json::Value, Error> {
+    let url = "https://api.github.com/repos/Huitzo-Inc/huitzo-launcher/releases";
+    let mut response = ureq::get(url)
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "huitzo-launcher")
+        .call()
+        .map_err(|e| Error::Network(format!("GitHub API request failed: {e}")))?;
+
+    let body = response
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| Error::Network(format!("Failed to read GitHub response: {e}")))?;
+
+    serde_json::from_str(&body)
+        .map_err(|e| Error::SelfUpdate(format!("Failed to parse releases JSON: {e}")))
+}
+
+/// Extract the latest launcher version from a releases JSON array.
+///
+/// Launcher releases are tagged `v*` (e.g. `v0.2.3`).
+/// CLI releases are tagged `cli-v*` and are excluded.
+fn find_latest_launcher_version(releases: &serde_json::Value) -> Option<String> {
+    let tag = releases
+        .as_array()?
+        .iter()
+        .filter_map(|r| r["tag_name"].as_str())
+        .find(|t| t.starts_with('v') && !t.starts_with("cli-v"))?;
+
+    Some(tag.strip_prefix('v').unwrap_or(tag).to_string())
 }
 
 /// Returns the platform-specific asset name for the current target triple.
@@ -292,5 +351,47 @@ mod tests {
             valid_fragments.iter().any(|f| name.contains(f)),
             "Unexpected platform asset name: {name}"
         );
+    }
+
+    #[test]
+    fn find_latest_launcher_version_picks_v_tag() {
+        let releases: serde_json::Value = serde_json::from_str(
+            r#"[
+                {"tag_name": "cli-v0.3.0"},
+                {"tag_name": "v0.2.5"},
+                {"tag_name": "v0.2.4"}
+            ]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            find_latest_launcher_version(&releases).as_deref(),
+            Some("0.2.5")
+        );
+    }
+
+    #[test]
+    fn find_latest_launcher_version_skips_cli_tags() {
+        let releases: serde_json::Value = serde_json::from_str(
+            r#"[
+                {"tag_name": "cli-v0.5.0"},
+                {"tag_name": "cli-v0.4.0"}
+            ]"#,
+        )
+        .unwrap();
+        assert_eq!(find_latest_launcher_version(&releases), None);
+    }
+
+    #[test]
+    fn find_latest_launcher_version_empty_releases() {
+        let releases: serde_json::Value = serde_json::from_str("[]").unwrap();
+        assert_eq!(find_latest_launcher_version(&releases), None);
+    }
+
+    #[test]
+    fn find_latest_launcher_version_no_v_prefix() {
+        let releases: serde_json::Value =
+            serde_json::from_str(r#"[{"tag_name": "0.2.5"}]"#).unwrap();
+        // Tag "0.2.5" does not start with 'v', so it should be skipped
+        assert_eq!(find_latest_launcher_version(&releases), None);
     }
 }

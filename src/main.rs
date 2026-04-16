@@ -76,28 +76,43 @@ fn run(args: Vec<String>) {
     // 5. Apply pending update if flagged
     if let Some(ref m) = manifest {
         if let Some(ref pending) = m.pending_update {
-            eprintln!("Updating huitzo to {}...", pending.version);
-            let update_ok = match pending.kind.as_str() {
-                "wheel" => {
-                    // Download compiled wheel from GitHub Releases.
-                    // Pass the Python version so ABI-keyed manifests resolve correctly.
-                    let pv = parse_python_version(&m.python_version);
-                    apply_wheel_update(pv).is_ok()
+            match pending.kind.as_str() {
+                "launcher" => {
+                    // Self-update the launcher binary from GitHub Releases.
+                    eprintln!("Updating huitzo-launcher to {}...", pending.version);
+                    let update_ok = update::self_update().is_ok();
+                    if update_ok {
+                        let mut updated = manifest::load().unwrap_or_else(|| m.clone_for_update());
+                        updated.pending_update = None;
+                        updated.launcher_version = pending.version.clone();
+                        let _ = manifest::save(&updated);
+                    }
                 }
-                "pip" => {
-                    // Legacy: install from PyPI (for manifests created before binary distribution)
-                    let index_url = std::env::var("HUITZO_INDEX_URL").ok();
-                    install::install_package("huitzo", index_url.as_deref()).is_ok()
+                kind => {
+                    eprintln!("Updating huitzo to {}...", pending.version);
+                    let update_ok = match kind {
+                        "wheel" => {
+                            // Download compiled wheel from GitHub Releases.
+                            // Pass the Python version so ABI-keyed manifests resolve correctly.
+                            let pv = parse_python_version(&m.python_version);
+                            apply_wheel_update(pv).is_ok()
+                        }
+                        "pip" => {
+                            // Legacy: install from PyPI (for manifests created before binary distribution)
+                            let index_url = std::env::var("HUITZO_INDEX_URL").ok();
+                            install::install_package("huitzo", index_url.as_deref()).is_ok()
+                        }
+                        _ => false,
+                    };
+                    if update_ok {
+                        let mut updated = manifest::load().unwrap_or_else(|| m.clone_for_update());
+                        updated.pending_update = None;
+                        if let Ok(Some(v)) = install::get_installed_version("huitzo") {
+                            updated.huitzo_version = v;
+                        }
+                        let _ = manifest::save(&updated);
+                    }
                 }
-                _ => false,
-            };
-            if update_ok {
-                let mut updated = manifest::load().unwrap_or_else(|| m.clone_for_update());
-                updated.pending_update = None;
-                if let Ok(Some(v)) = install::get_installed_version("huitzo") {
-                    updated.huitzo_version = v;
-                }
-                let _ = manifest::save(&updated);
             }
         }
     }
