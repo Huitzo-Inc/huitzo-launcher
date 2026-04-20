@@ -1,6 +1,6 @@
 [package]
 name = "huitzo"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2024"
 rust-version = "1.85"
 description = "Huitzo CLI launcher — manages Python environment and execs into huitzo_cli"

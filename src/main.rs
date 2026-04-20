@@ -64,16 +64,23 @@ fn run(args: Vec<String>) {
         }
     }
 
-    // 4. Background update check (non-blocking)
-    if let Some(ref m) = manifest {
-        if !update::should_skip() && manifest::needs_update_check(m) {
-            std::thread::spawn(|| {
-                update::background_check();
-            });
+    // 4. Synchronous update check (bounded to 5 s) — must complete before execvp.
+    // On Unix, execvp(2) replaces the process image and kills all threads; a detached
+    // background thread never gets to write manifest.json. We block here (with timeout)
+    // so the manifest is always persisted before we hand off to Python.
+    if !update::should_skip() {
+        let needs_check = manifest
+            .as_ref()
+            .is_some_and(|m| manifest::needs_update_check(m));
+        if needs_check {
+            update::sync_check();
         }
     }
 
-    // 5. Apply pending update if flagged
+    // 5. Reload manifest — sync_check may have written a pending update.
+    let manifest = manifest::load().or(manifest);
+
+    // 6. Apply pending update if flagged
     if let Some(ref m) = manifest {
         if let Some(ref pending) = m.pending_update {
             match pending.kind.as_str() {
@@ -117,7 +124,7 @@ fn run(args: Vec<String>) {
         }
     }
 
-    // 6. Exec into Python CLI (never returns on Unix)
+    // 7. Exec into Python CLI (never returns on Unix)
     if let Err(e) = exec::exec_into_python(&dirs::venv_python(), &args) {
         eprintln!("Error: {e}");
         std::process::exit(errors::exit_code(&e));
