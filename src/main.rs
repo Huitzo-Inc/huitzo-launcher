@@ -69,9 +69,7 @@ fn run(args: Vec<String>) {
     // background thread never gets to write manifest.json. We block here (with timeout)
     // so the manifest is always persisted before we hand off to Python.
     if !update::should_skip() {
-        let needs_check = manifest
-            .as_ref()
-            .is_some_and(manifest::needs_update_check);
+        let needs_check = manifest.as_ref().is_some_and(manifest::needs_update_check);
         if needs_check {
             update::sync_check();
         }
