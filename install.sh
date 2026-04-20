@@ -51,19 +51,31 @@ detect_platform() {
 }
 
 fetch_latest_version() {
-    echo "  Fetching latest release..."
-    API_RESPONSE=$(curl -sSf "https://api.github.com/repos/$REPO/releases/latest")
-    DOWNLOAD_URL=$(echo "$API_RESPONSE" | grep "browser_download_url.*${ASSET}\"" | head -1 | cut -d '"' -f 4)
-    SHA256_URL=$(echo "$API_RESPONSE" | grep "browser_download_url.*${ASSET}.sha256\"" | head -1 | cut -d '"' -f 4)
+    echo "  Fetching latest launcher release..."
 
-    if [ -z "$DOWNLOAD_URL" ]; then
-        echo "Error: Could not find binary for $ASSET"
+    # Fetch up to 20 releases (newest first).  /releases/latest returns the most
+    # recently *published* release — which may be a cli-v* CLI release, not a
+    # launcher release.  We filter for the first v* tag that is NOT cli-v*.
+    API_RESPONSE=$(curl -sSf "https://api.github.com/repos/$REPO/releases?per_page=20")
+
+    VERSION=$(printf '%s\n' "$API_RESPONSE" \
+        | grep '"tag_name"' \
+        | grep -v '"cli-v' \
+        | grep '"v[0-9]' \
+        | head -1 \
+        | sed 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+
+    if [ -z "$VERSION" ]; then
+        echo "Error: No launcher release found."
         echo "Check: https://github.com/$REPO/releases"
         exit 1
     fi
 
-    VERSION=$(echo "$API_RESPONSE" | grep '"tag_name"' | head -1 | cut -d '"' -f 4)
     echo "  Version: $VERSION"
+
+    # Construct URLs directly — we know the asset naming convention.
+    DOWNLOAD_URL="https://github.com/$REPO/releases/download/$VERSION/$ASSET"
+    SHA256_URL="${DOWNLOAD_URL}.sha256"
 }
 
 clean_conflicts() {

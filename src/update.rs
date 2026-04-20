@@ -5,21 +5,33 @@ use crate::manifest::{self, PendingUpdate};
 use sha2::{Digest, Sha256};
 use std::io::Read;
 
-/// GitHub Releases API URL for the launcher.
-const GITHUB_RELEASES_URL: &str =
-    "https://api.github.com/repos/Huitzo-Inc/huitzo-launcher/releases/latest";
-
 /// Check if update checking is disabled via environment variable.
 pub fn should_skip() -> bool {
     std::env::var("HUITZO_SKIP_UPDATE_CHECK")
         .is_ok_and(|v| !v.is_empty() && v != "0" && v.to_lowercase() != "false")
 }
 
-/// Background update check: queries GitHub Releases for newer launcher and CLI versions.
+/// Run the update check synchronously with a 5-second timeout.
+///
+/// Spawns the check in a thread so the network call is bounded; the main thread
+/// blocks until the check completes or the timeout elapses, then proceeds to
+/// `exec_into_python`. This guarantees the manifest is written before `execvp`
+/// replaces the process (killing any detached thread).
+pub fn sync_check() {
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        background_check();
+        let _ = tx.send(());
+    });
+    // Proceed silently if the network is unreachable or slow.
+    let _ = rx.recv_timeout(std::time::Duration::from_secs(5));
+}
+
+/// Update check: queries GitHub Releases for newer launcher and CLI versions.
 ///
 /// Checks the launcher first (higher priority), then the CLI.
 /// Updates the manifest with the check timestamp and any pending update.
-/// Errors are silently ignored (non-blocking).
+/// Errors are silently ignored.
 pub fn background_check() {
     let Some(mut m) = manifest::load() else {
         return;
@@ -27,11 +39,6 @@ pub fn background_check() {
 
     // Check for launcher self-update first (higher priority)
     if let Some(latest) = check_launcher_version() {
-        eprintln!(
-            "huitzo-launcher {latest} is available (installed: {}). \
-             Update will apply on next launch.",
-            env!("CARGO_PKG_VERSION")
-        );
         m.pending_update = Some(PendingUpdate {
             kind: "launcher".to_string(),
             version: latest,
@@ -39,11 +46,6 @@ pub fn background_check() {
     } else if let Some(latest) = download::check_cli_release_version() {
         // Only check CLI if launcher is already up-to-date
         if version_is_newer(&latest, &m.huitzo_version) {
-            eprintln!(
-                "huitzo {latest} is available (installed: {}). \
-                 Update will apply on next launch.",
-                m.huitzo_version
-            );
             m.pending_update = Some(PendingUpdate {
                 kind: "wheel".to_string(),
                 version: latest,
@@ -125,19 +127,23 @@ pub fn platform_asset_name() -> &'static str {
 
 /// Self-update the launcher binary from GitHub Releases.
 ///
-/// Checks the latest release, downloads the binary and checksum,
-/// verifies integrity, and atomically replaces the current binary.
+/// Filters the releases list for `v*` tags (excludes `cli-v*`) so that a CLI
+/// release published after the latest launcher release does not shadow it.
+/// Verifies integrity and atomically replaces the current binary.
 pub fn self_update() -> Result<(), Error> {
     let current_version = env!("CARGO_PKG_VERSION");
     eprintln!("Checking for launcher updates (current: v{current_version})...");
 
-    // 1. Fetch latest release metadata from GitHub
-    let release = fetch_latest_release()?;
+    // 1. Fetch all releases and find the latest launcher release (v*, excluding cli-v*)
+    let releases = fetch_all_releases()?;
+    let release = find_latest_launcher_release(&releases).ok_or_else(|| {
+        Error::SelfUpdate("No launcher release found (expected v* tag)".to_string())
+    })?;
+
     let tag = release["tag_name"]
         .as_str()
-        .ok_or_else(|| Error::SelfUpdate("No tag_name in release response".to_string()))?;
+        .ok_or_else(|| Error::SelfUpdate("No tag_name in release".to_string()))?;
 
-    // Strip leading 'v' if present for version comparison
     let latest_version = tag.strip_prefix('v').unwrap_or(tag);
 
     // 2. Compare versions
@@ -204,21 +210,16 @@ pub fn self_update() -> Result<(), Error> {
     Ok(())
 }
 
-/// Fetch the latest release JSON from GitHub Releases API.
-fn fetch_latest_release() -> Result<serde_json::Value, Error> {
-    let mut response = ureq::get(GITHUB_RELEASES_URL)
-        .header("Accept", "application/vnd.github+json")
-        .header("User-Agent", "huitzo-launcher")
-        .call()
-        .map_err(|e| Error::Network(format!("GitHub API request failed: {e}")))?;
-
-    let body_str = response
-        .body_mut()
-        .read_to_string()
-        .map_err(|e| Error::Network(format!("Failed to read GitHub response: {e}")))?;
-
-    serde_json::from_str(&body_str)
-        .map_err(|e| Error::SelfUpdate(format!("Failed to parse release JSON: {e}")))
+/// Find the full release JSON object for the latest launcher release.
+///
+/// Launcher releases are tagged `v*` (e.g. `v0.2.5`); CLI releases are tagged
+/// `cli-v*` and are excluded. Returns a reference into `releases`.
+fn find_latest_launcher_release(releases: &serde_json::Value) -> Option<&serde_json::Value> {
+    releases.as_array()?.iter().find(|r| {
+        r["tag_name"]
+            .as_str()
+            .is_some_and(|t| t.starts_with('v') && !t.starts_with("cli-v"))
+    })
 }
 
 /// Find the download URL for a named asset in the release assets array.
@@ -396,7 +397,28 @@ mod tests {
     fn find_latest_launcher_version_no_v_prefix() {
         let releases: serde_json::Value =
             serde_json::from_str(r#"[{"tag_name": "0.2.5"}]"#).unwrap();
-        // Tag "0.2.5" does not start with 'v', so it should be skipped
         assert_eq!(find_latest_launcher_version(&releases), None);
+    }
+
+    #[test]
+    fn find_latest_launcher_release_skips_cli_tag_returns_full_object() {
+        let releases: serde_json::Value = serde_json::from_str(
+            r#"[
+                {"tag_name": "cli-v0.3.0", "assets": []},
+                {"tag_name": "v0.2.5",     "assets": [{"name": "huitzo-x86_64-apple-darwin"}]}
+            ]"#,
+        )
+        .unwrap();
+        let release = find_latest_launcher_release(&releases).unwrap();
+        assert_eq!(release["tag_name"].as_str(), Some("v0.2.5"));
+        assert!(release["assets"].as_array().is_some());
+    }
+
+    #[test]
+    fn find_latest_launcher_release_returns_none_when_only_cli_tags() {
+        let releases: serde_json::Value =
+            serde_json::from_str(r#"[{"tag_name": "cli-v0.5.0"}, {"tag_name": "cli-v0.4.0"}]"#)
+                .unwrap();
+        assert!(find_latest_launcher_release(&releases).is_none());
     }
 }

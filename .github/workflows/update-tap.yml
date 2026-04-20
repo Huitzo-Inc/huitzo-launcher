@@ -1,0 +1,96 @@
+name: Update Homebrew Tap
+
+# Runs after every launcher release (v* tags only, not cli-v* CLI releases).
+# Requires a repository secret TAP_UPDATE_TOKEN — a GitHub PAT or fine-grained
+# token with Contents:write access to Huitzo-Inc/homebrew-tap.
+on:
+  release:
+    types: [published]
+
+jobs:
+  update-tap:
+    if: startsWith(github.ref_name, 'v') && !startsWith(github.ref_name, 'cli-v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Collect SHA256 checksums from release assets
+        id: shas
+        run: |
+          TAG="${{ github.ref_name }}"
+          BASE="https://github.com/Huitzo-Inc/huitzo-launcher/releases/download/${TAG}"
+
+          fetch_sha() {
+            curl -sSfL "${BASE}/${1}.sha256" | awk '{print $1}'
+          }
+
+          echo "arm_mac=$(fetch_sha huitzo-aarch64-apple-darwin)"              >> "$GITHUB_OUTPUT"
+          echo "intel_mac=$(fetch_sha huitzo-x86_64-apple-darwin)"             >> "$GITHUB_OUTPUT"
+          echo "arm_linux=$(fetch_sha huitzo-aarch64-unknown-linux-musl)"      >> "$GITHUB_OUTPUT"
+          echo "intel_linux=$(fetch_sha huitzo-x86_64-unknown-linux-musl)"     >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}"                                               >> "$GITHUB_OUTPUT"
+
+      - name: Checkout homebrew-tap
+        uses: actions/checkout@v4
+        with:
+          repository: Huitzo-Inc/homebrew-tap
+          token: ${{ secrets.TAP_UPDATE_TOKEN }}
+          path: tap
+
+      - name: Update formula version and checksums
+        run: |
+          python3 - <<'EOF'
+          import re
+
+          with open("tap/Formula/huitzo.rb") as f:
+              content = f.read()
+
+          version     = "${{ steps.shas.outputs.version }}"
+          arm_mac     = "${{ steps.shas.outputs.arm_mac }}"
+          intel_mac   = "${{ steps.shas.outputs.intel_mac }}"
+          arm_linux   = "${{ steps.shas.outputs.arm_linux }}"
+          intel_linux = "${{ steps.shas.outputs.intel_linux }}"
+
+          # Update version line
+          content = re.sub(r'version "[^"]+"', f'version "{version}"', content)
+
+          # Update each sha256 by matching the url line immediately before it
+          checksums = {
+              "aarch64-apple-darwin":       arm_mac,
+              "x86_64-apple-darwin":        intel_mac,
+              "aarch64-unknown-linux-musl": arm_linux,
+              "x86_64-unknown-linux-musl":  intel_linux,
+          }
+          for platform, sha in checksums.items():
+              content = re.sub(
+                  rf'(url "[^"]*{re.escape(platform)}[^"]*"\n(\s+))sha256 "[^"]+"',
+                  rf'\1sha256 "{sha}"',
+                  content,
+              )
+
+          with open("tap/Formula/huitzo.rb", "w") as f:
+              f.write(content)
+
+          print(f"Formula updated to v{version}")
+          EOF
+
+      - name: Commit and open PR
+        run: |
+          cd tap
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          BRANCH="auto/bump-huitzo-${{ steps.shas.outputs.version }}"
+          git checkout -b "$BRANCH"
+          git add Formula/huitzo.rb
+          git commit -m "chore: bump huitzo launcher to v${{ steps.shas.outputs.version }}"
+          git push origin "$BRANCH"
+
+          gh pr create \
+            --title "chore: bump huitzo launcher to v${{ steps.shas.outputs.version }}" \
+            --body "Automated formula update triggered by https://github.com/Huitzo-Inc/huitzo-launcher/releases/tag/${{ github.ref_name }}" \
+            --base main \
+            --head "$BRANCH"
+        env:
+          GH_TOKEN: ${{ secrets.TAP_UPDATE_TOKEN }}
