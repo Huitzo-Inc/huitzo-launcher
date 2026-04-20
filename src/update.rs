@@ -136,8 +136,9 @@ pub fn self_update() -> Result<(), Error> {
 
     // 1. Fetch all releases and find the latest launcher release (v*, excluding cli-v*)
     let releases = fetch_all_releases()?;
-    let release = find_latest_launcher_release(&releases)
-        .ok_or_else(|| Error::SelfUpdate("No launcher release found (expected v* tag)".to_string()))?;
+    let release = find_latest_launcher_release(&releases).ok_or_else(|| {
+        Error::SelfUpdate("No launcher release found (expected v* tag)".to_string())
+    })?;
 
     let tag = release["tag_name"]
         .as_str()
@@ -415,10 +416,9 @@ mod tests {
 
     #[test]
     fn find_latest_launcher_release_returns_none_when_only_cli_tags() {
-        let releases: serde_json::Value = serde_json::from_str(
-            r#"[{"tag_name": "cli-v0.5.0"}, {"tag_name": "cli-v0.4.0"}]"#,
-        )
-        .unwrap();
+        let releases: serde_json::Value =
+            serde_json::from_str(r#"[{"tag_name": "cli-v0.5.0"}, {"tag_name": "cli-v0.4.0"}]"#)
+                .unwrap();
         assert!(find_latest_launcher_release(&releases).is_none());
     }
 }
