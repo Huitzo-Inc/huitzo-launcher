@@ -71,7 +71,7 @@ fn run(args: Vec<String>) {
     if !update::should_skip() {
         let needs_check = manifest
             .as_ref()
-            .is_some_and(|m| manifest::needs_update_check(m));
+            .is_some_and(manifest::needs_update_check);
         if needs_check {
             update::sync_check();
         }
