@@ -11,6 +11,19 @@ pub fn should_skip() -> bool {
         .is_ok_and(|v| !v.is_empty() && v != "0" && v.to_lowercase() != "false")
 }
 
+/// Returns true if this binary was installed by Homebrew.
+///
+/// Homebrew installs binaries under a versioned Cellar path
+/// (e.g. `/opt/homebrew/Cellar/huitzo/0.2.5/bin/huitzo`).
+/// We detect this so the launcher never tries to overwrite a
+/// Homebrew-managed binary — `brew upgrade huitzo` handles that.
+pub fn is_homebrew_install() -> bool {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(|s| s.to_string()))
+        .is_some_and(|s| s.contains("/Cellar/") || s.contains("/homebrew/"))
+}
+
 /// Run the update check synchronously with a 5-second timeout.
 ///
 /// Spawns the check in a thread so the network call is bounded; the main thread
@@ -37,19 +50,26 @@ pub fn background_check() {
         return;
     };
 
-    // Check for launcher self-update first (higher priority)
-    if let Some(latest) = check_launcher_version() {
-        m.pending_update = Some(PendingUpdate {
-            kind: "launcher".to_string(),
-            version: latest,
-        });
-    } else if let Some(latest) = download::check_cli_release_version() {
-        // Only check CLI if launcher is already up-to-date
-        if version_is_newer(&latest, &m.huitzo_version) {
+    // Check for launcher self-update first (higher priority).
+    // Skip for Homebrew installs — replacing a Cellar binary breaks brew integrity.
+    // Homebrew users get launcher updates via `brew upgrade huitzo` instead.
+    if !is_homebrew_install() {
+        if let Some(latest) = check_launcher_version() {
             m.pending_update = Some(PendingUpdate {
-                kind: "wheel".to_string(),
+                kind: "launcher".to_string(),
                 version: latest,
             });
+        }
+    }
+
+    if m.pending_update.is_none() {
+        if let Some(latest) = download::check_cli_release_version() {
+            if version_is_newer(&latest, &m.huitzo_version) {
+                m.pending_update = Some(PendingUpdate {
+                    kind: "wheel".to_string(),
+                    version: latest,
+                });
+            }
         }
     }
 
@@ -132,6 +152,12 @@ pub fn platform_asset_name() -> &'static str {
 /// Verifies integrity and atomically replaces the current binary.
 pub fn self_update() -> Result<(), Error> {
     let current_version = env!("CARGO_PKG_VERSION");
+
+    if is_homebrew_install() {
+        eprintln!("Launcher is managed by Homebrew. Run 'brew upgrade huitzo' to update.");
+        return Ok(());
+    }
+
     eprintln!("Checking for launcher updates (current: v{current_version})...");
 
     // 1. Fetch all releases and find the latest launcher release (v*, excluding cli-v*)
