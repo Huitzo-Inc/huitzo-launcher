@@ -140,7 +140,7 @@ jobs:
           echo "version=${TAG#v}"                                               >> "$GITHUB_OUTPUT"
 
       - name: Checkout homebrew-tap
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: Huitzo-Inc/homebrew-tap
           token: ${{ secrets.TAP_UPDATE_TOKEN }}
