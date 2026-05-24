@@ -16,6 +16,11 @@ pub enum Error {
     SelfUpdate(String),
     /// exec() failed.
     Exec(String),
+    /// Deployment-root key fingerprint mismatch on TOFU verification.
+    /// Critical security event; refuse to continue.
+    TrustViolation { stored: String, advertised: String },
+    /// Bundle integrity / signature verification failed.
+    BundleVerify { reason: String },
 }
 
 impl fmt::Display for Error {
@@ -48,6 +53,20 @@ impl fmt::Display for Error {
                  Update manually: https://github.com/Huitzo-Inc/huitzo-launcher/releases"
             ),
             Error::Exec(detail) => write!(f, "Failed to exec into Python CLI: {detail}"),
+            Error::TrustViolation { stored, advertised } => write!(
+                f,
+                "Deployment trust mismatch\n\
+                 \x20 Stored fingerprint:    {stored}\n\
+                 \x20 Advertised fingerprint: {advertised}\n\n\
+                 This is a CRITICAL security event. Refusing to install bundle.\n\
+                 If you trust this rotation, run:\n\
+                 \x20 huitzo --launcher-trust-rotate"
+            ),
+            Error::BundleVerify { reason } => write!(
+                f,
+                "Bundle verification failed: {reason}\n\n\
+                 Refusing to install untrusted bundle."
+            ),
         }
     }
 }
@@ -67,6 +86,8 @@ pub fn exit_code(err: &Error) -> i32 {
         Error::Network(_) => 69,    // EX_UNAVAILABLE
         Error::Manifest(_) => 66,   // EX_NOINPUT
         Error::SelfUpdate(_) => 1,
-        Error::Exec(_) => 126, // Command found but not executable
+        Error::Exec(_) => 126,              // Command found but not executable
+        Error::TrustViolation { .. } => 77, // EX_NOPERM
+        Error::BundleVerify { .. } => 77,   // EX_NOPERM
     }
 }

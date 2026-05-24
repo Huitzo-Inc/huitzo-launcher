@@ -16,6 +16,25 @@ pub struct PendingUpdate {
     pub version: String,
 }
 
+/// Cached capability-document state for the active deployment.
+///
+/// Schema v3+ only. Persisted so the launcher can skip the network on
+/// subsequent invocations and still know which SDK + extension versions
+/// are staged on disk.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CapabilityCache {
+    /// Deployment host (e.g. `huitzo.ai`).
+    pub deployment: String,
+    /// SDK version currently staged under `~/.huitzo/sdk/<host>/<version>/`.
+    pub sdk_version: String,
+    /// Bundle sha256 (hex) — primary integrity anchor.
+    pub bundle_sha256: String,
+    /// ISO-8601 issued_at from the capability response.
+    pub issued_at: String,
+    /// Unix timestamp of the last successful refresh.
+    pub last_refreshed: u64,
+}
+
 /// Launcher state persisted at `~/.huitzo/manifest.json`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Manifest {
@@ -33,6 +52,12 @@ pub struct Manifest {
     /// Platform tag for the installed wheel (e.g. "linux-x86_64").
     #[serde(default)]
     pub wheel_platform: Option<String>,
+    /// v3+: host of the deployment whose bundle is currently active.
+    #[serde(default)]
+    pub active_deployment: Option<String>,
+    /// v3+: cached capability document for the active deployment.
+    #[serde(default)]
+    pub capability_cache: Option<CapabilityCache>,
 }
 
 /// Load manifest from disk. Returns `None` if the file doesn't exist.
@@ -44,13 +69,21 @@ pub fn load() -> Option<Manifest> {
     let content = std::fs::read_to_string(&path).ok()?;
     match serde_json::from_str::<Manifest>(&content) {
         Ok(mut m) => {
-            // Auto-migrate v1 → v2: add new fields with defaults
+            let pre_migration = m.schema_version;
+            // v1 → v2: install_source/wheel_platform defaulted in.
             if m.schema_version < 2 {
                 m.schema_version = 2;
                 if m.install_source.is_none() {
                     m.install_source = Some("pypi".to_string());
                 }
-                // Save migrated manifest (best-effort)
+            }
+            // v2 → v3: active_deployment / capability_cache default to None;
+            // bump the schema marker so future readers can rely on the new
+            // fields existing structurally even when still empty.
+            if m.schema_version < 3 {
+                m.schema_version = 3;
+            }
+            if m.schema_version != pre_migration {
                 let _ = save(&m);
             }
             Some(m)
@@ -106,7 +139,7 @@ mod tests {
     #[test]
     fn manifest_round_trip() {
         let manifest = Manifest {
-            schema_version: 2,
+            schema_version: 3,
             python_path: "/usr/bin/python3.13".to_string(),
             python_version: "3.13".to_string(),
             huitzo_version: "0.1.7".to_string(),
@@ -116,14 +149,30 @@ mod tests {
             created_at: now_secs(),
             install_source: Some("github_release".to_string()),
             wheel_platform: Some("linux_x86_64".to_string()),
+            active_deployment: Some("huitzo.ai".to_string()),
+            capability_cache: Some(CapabilityCache {
+                deployment: "huitzo.ai".to_string(),
+                sdk_version: "0.5.2".to_string(),
+                bundle_sha256: "abc".to_string(),
+                issued_at: "2026-05-23T20:00:00Z".to_string(),
+                last_refreshed: 0,
+            }),
         };
 
         let json = serde_json::to_string(&manifest).unwrap();
         let parsed: Manifest = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.huitzo_version, "0.1.7");
-        assert_eq!(parsed.schema_version, 2);
+        assert_eq!(parsed.schema_version, 3);
         assert_eq!(parsed.install_source.as_deref(), Some("github_release"));
         assert_eq!(parsed.wheel_platform.as_deref(), Some("linux_x86_64"));
+        assert_eq!(parsed.active_deployment.as_deref(), Some("huitzo.ai"));
+        assert_eq!(
+            parsed
+                .capability_cache
+                .as_ref()
+                .map(|c| c.sdk_version.as_str()),
+            Some("0.5.2")
+        );
     }
 
     #[test]
@@ -143,12 +192,34 @@ mod tests {
         assert_eq!(parsed.schema_version, 1);
         assert!(parsed.install_source.is_none());
         assert!(parsed.wheel_platform.is_none());
+        assert!(parsed.active_deployment.is_none());
+        assert!(parsed.capability_cache.is_none());
+    }
+
+    #[test]
+    fn manifest_v2_compat_loads_with_no_capability_fields() {
+        let json = r#"{
+            "schema_version": 2,
+            "python_path": "/usr/bin/python3.13",
+            "python_version": "3.13",
+            "huitzo_version": "0.2.0",
+            "launcher_version": "0.2.7",
+            "last_update_check": 0,
+            "pending_update": null,
+            "created_at": 0,
+            "install_source": "github_release",
+            "wheel_platform": "linux-x86_64"
+        }"#;
+        let parsed: Manifest = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.schema_version, 2);
+        assert!(parsed.active_deployment.is_none());
+        assert!(parsed.capability_cache.is_none());
     }
 
     #[test]
     fn needs_update_check_when_stale() {
         let manifest = Manifest {
-            schema_version: 2,
+            schema_version: 3,
             python_path: String::new(),
             python_version: String::new(),
             huitzo_version: String::new(),
@@ -158,6 +229,8 @@ mod tests {
             created_at: 0,
             install_source: None,
             wheel_platform: None,
+            active_deployment: None,
+            capability_cache: None,
         };
         assert!(needs_update_check(&manifest));
     }
@@ -165,7 +238,7 @@ mod tests {
     #[test]
     fn no_update_check_when_fresh() {
         let manifest = Manifest {
-            schema_version: 2,
+            schema_version: 3,
             python_path: String::new(),
             python_version: String::new(),
             huitzo_version: String::new(),
@@ -175,6 +248,8 @@ mod tests {
             created_at: 0,
             install_source: None,
             wheel_platform: None,
+            active_deployment: None,
+            capability_cache: None,
         };
         assert!(!needs_update_check(&manifest));
     }

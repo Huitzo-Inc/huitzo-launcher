@@ -1,8 +1,11 @@
+mod bundle;
+mod capabilities;
 mod dirs;
 mod download;
 mod errors;
 mod exec;
 mod install;
+mod keys;
 mod manifest;
 mod python;
 mod update;
@@ -46,10 +49,96 @@ fn main() {
         return;
     }
 
-    run(args);
+    // Emergency TOFU rotation: operator opts in to overwrite a pinned key
+    // after a deployment-root rotation outside the (deferred) overlap-
+    // window mechanism. The flag is consumed here so it never reaches the
+    // Python CLI on exec.
+    let force_trust_rotate = args.iter().any(|a| a == "--launcher-trust-rotate");
+    let args: Vec<String> = args
+        .into_iter()
+        .filter(|a| a != "--launcher-trust-rotate")
+        .collect();
+
+    run_with(args, force_trust_rotate);
 }
 
 fn run(args: Vec<String>) {
+    run_with(args, false);
+}
+
+/// Refresh the active deployment's capability document and re-stage the
+/// SDK bundle if the marker file `~/.huitzo/.needs-capability-refresh` is
+/// present (written by `huitzo login` and `huitzo config set api_url` on
+/// the Python side). Best-effort: a network failure must not block exec
+/// into the CLI, but a trust-violation or signature-failure must.
+///
+/// Returns `true` if the launcher should refuse to continue (trust /
+/// signature failure). Network errors are logged and treated as soft
+/// failures so already-staged bundles keep working offline.
+fn refresh_capabilities_if_needed(force_trust_rotate: bool) -> bool {
+    let marker = dirs::capability_refresh_marker();
+    if !marker.exists() {
+        return false;
+    }
+    let api_url = match std::fs::read_to_string(&marker) {
+        Ok(s) => s.trim().to_string(),
+        Err(_) => return false,
+    };
+    if api_url.is_empty() {
+        let _ = std::fs::remove_file(&marker);
+        return false;
+    }
+
+    let host = match keys::canonical_host(&api_url) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("Warning: invalid deployment URL in capability marker: {e}");
+            let _ = std::fs::remove_file(&marker);
+            return false;
+        }
+    };
+
+    eprintln!("Refreshing capabilities for {host}...");
+    match capabilities::fetch_and_verify(&api_url, &host, force_trust_rotate) {
+        Ok((doc, pinned)) => {
+            // Verification succeeded; stage the bundle on disk.
+            if let Err(e) = bundle::stage_bundle(&host, &doc, &pinned.key) {
+                if matches!(e, Error::BundleVerify { .. }) {
+                    eprintln!("Error: {e}");
+                    std::process::exit(errors::exit_code(&e));
+                }
+                eprintln!("Warning: bundle stage failed (non-fatal): {e}");
+                return false;
+            }
+            // Persist the new active deployment + capability cache.
+            if let Some(mut m) = manifest::load() {
+                m.active_deployment = Some(host.clone());
+                m.capability_cache = Some(manifest::CapabilityCache {
+                    deployment: host.clone(),
+                    sdk_version: doc.sdk.version.clone(),
+                    bundle_sha256: doc.sdk.bundle_sha256.clone(),
+                    issued_at: doc.issued_at.clone(),
+                    last_refreshed: manifest::now_secs(),
+                });
+                let _ = manifest::save(&m);
+            }
+            let _ = std::fs::remove_file(&marker);
+            false
+        }
+        Err(e) => match e {
+            Error::TrustViolation { .. } | Error::BundleVerify { .. } => {
+                eprintln!("Error: {e}");
+                std::process::exit(errors::exit_code(&e));
+            }
+            other => {
+                eprintln!("Warning: capability refresh failed (non-fatal): {other}");
+                false
+            }
+        },
+    }
+}
+
+fn run_with(args: Vec<String>, force_trust_rotate: bool) {
     // 1. Read manifest
     let manifest = manifest::load();
 
@@ -122,7 +211,12 @@ fn run(args: Vec<String>) {
         }
     }
 
-    // 7. Exec into Python CLI (never returns on Unix)
+    // 7. Refresh deployment capabilities + bundle if a marker is present
+    // (set by `huitzo config set api_url` / `huitzo login` on the Python
+    // side). Trust violations + signature failures exit before exec.
+    let _ = refresh_capabilities_if_needed(force_trust_rotate);
+
+    // 8. Exec into Python CLI (never returns on Unix)
     if let Err(e) = exec::exec_into_python(&dirs::venv_python(), &args) {
         eprintln!("Error: {e}");
         std::process::exit(errors::exit_code(&e));
@@ -190,7 +284,7 @@ fn bootstrap() -> Result<(), Error> {
     let (install_source, wheel_platform) = detect_install_source();
 
     manifest::save(&Manifest {
-        schema_version: 2,
+        schema_version: 3,
         python_path: py_used.path.to_string_lossy().to_string(),
         python_version: format!("{}.{}", py_used.version.0, py_used.version.1),
         huitzo_version: version,
@@ -200,6 +294,8 @@ fn bootstrap() -> Result<(), Error> {
         created_at: manifest::now_secs(),
         install_source: Some(install_source),
         wheel_platform,
+        active_deployment: None,
+        capability_cache: None,
     })?;
 
     Ok(())
@@ -380,6 +476,8 @@ impl Manifest {
             created_at: self.created_at,
             install_source: self.install_source.clone(),
             wheel_platform: self.wheel_platform.clone(),
+            active_deployment: self.active_deployment.clone(),
+            capability_cache: None,
         }
     }
 }
