@@ -191,6 +191,68 @@ pub fn find_platform_wheel(
         })
 }
 
+/// Stream the response body of `url` to `dest`, computing SHA-256 on the way,
+/// and verify it matches `expected_sha256` (hex, lowercase).
+///
+/// On mismatch the file is deleted and a `BundleVerify` error is returned so
+/// callers downstream of the launcher's trust boundary can distinguish a
+/// checksum failure from a generic network failure. Use this for any
+/// signature-anchored artefact (capability bundles, wheels). `dest`'s parent
+/// directory is created if missing.
+pub fn stream_to_file_with_hash(
+    url: &str,
+    dest: &std::path::Path,
+    expected_sha256: &str,
+) -> Result<(), Error> {
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| Error::PipInstall(format!("Failed to create dest dir: {e}")))?;
+    }
+
+    let mut response = ureq::get(url)
+        .header("User-Agent", "huitzo-launcher")
+        .call()
+        .map_err(|e| Error::Network(format!("Failed to fetch {url}: {e}")))?;
+
+    let mut file = std::fs::File::create(dest)
+        .map_err(|e| Error::PipInstall(format!("Failed to create {}: {e}", dest.display())))?;
+
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 8192];
+    let mut reader = response.body_mut().as_reader();
+
+    loop {
+        let n = reader
+            .read(&mut buf)
+            .map_err(|e| Error::Network(format!("Download interrupted: {e}")))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        std::io::Write::write_all(&mut file, &buf[..n])
+            .map_err(|e| Error::PipInstall(format!("Failed to write file: {e}")))?;
+    }
+
+    let computed: String = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    if !computed.eq_ignore_ascii_case(expected_sha256) {
+        let _ = std::fs::remove_file(dest);
+        return Err(Error::BundleVerify {
+            reason: format!(
+                "checksum mismatch for {}\n  expected: {}\n  got:      {}",
+                dest.display(),
+                expected_sha256,
+                computed
+            ),
+        });
+    }
+
+    Ok(())
+}
+
 /// Download a wheel file from a GitHub Release, verify its SHA-256 checksum,
 /// and save it to the cache directory.
 ///
@@ -217,42 +279,15 @@ pub fn download_wheel(release_version: &str, wheel: &WheelInfo) -> Result<PathBu
 
     eprintln!("  Downloading {}...", wheel.filename);
 
-    let mut response = ureq::get(&url)
-        .header("User-Agent", "huitzo-launcher")
-        .call()
-        .map_err(|e| Error::Network(format!("Failed to download wheel: {e}")))?;
-
-    let mut file = std::fs::File::create(&dest)
-        .map_err(|e| Error::PipInstall(format!("Failed to create wheel file: {e}")))?;
-
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 8192];
-    let mut reader = response.body_mut().as_reader();
-
-    loop {
-        let n = reader
-            .read(&mut buf)
-            .map_err(|e| Error::Network(format!("Download interrupted: {e}")))?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-        std::io::Write::write_all(&mut file, &buf[..n])
-            .map_err(|e| Error::PipInstall(format!("Failed to write wheel: {e}")))?;
-    }
-
-    // Verify checksum
-    let computed: String = hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    if computed != wheel.sha256 {
-        let _ = std::fs::remove_file(&dest);
-        return Err(Error::PipInstall(format!(
-            "Wheel checksum mismatch!\n  Expected: {}\n  Got:      {}",
-            wheel.sha256, computed
-        )));
+    // Reuse the shared streaming helper; remap BundleVerify → PipInstall here
+    // so the wheel-install code path keeps its existing error contract.
+    if let Err(e) = stream_to_file_with_hash(&url, &dest, &wheel.sha256) {
+        return match e {
+            Error::BundleVerify { reason } => Err(Error::PipInstall(format!(
+                "Wheel checksum mismatch: {reason}"
+            ))),
+            other => Err(other),
+        };
     }
 
     eprintln!("  Checksum verified.");
