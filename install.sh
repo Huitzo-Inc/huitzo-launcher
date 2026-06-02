@@ -3,7 +3,9 @@
 # Usage: curl -sSf https://raw.githubusercontent.com/Huitzo-Inc/huitzo-launcher/main/install.sh | sh
 #
 # This single command:
-#   1. Asks for (and records) informed consent before installing anything.
+#   1. Asks for informed consent before installing anything. The grant is
+#      recorded to the launcher's local, metadata-only consent ledger
+#      (~/.huitzo/consent.jsonl) by the launcher binary on first run.
 #   2. Installs the Huitzo launcher binary (which manages the Huitzo CLI).
 #   3. Runs a capability check (huitzo / claude / git) so you know exactly
 #      what is present and what is still missing — all in one shot.
@@ -45,9 +47,12 @@ main() {
 }
 
 # Logged informed consent BEFORE downloading or executing third-party
-# software (S29 consent pattern). The decision is appended to the launcher's
-# local, metadata-only consent ledger after the binary is installed; here we
-# obtain the up-front affirmative so the curl|sh flow never silently installs.
+# software (S29 consent pattern). Here we obtain the up-front affirmative so
+# the curl|sh flow never silently installs. The corresponding GRANT is then
+# recorded to the launcher's local, metadata-only consent ledger
+# (~/.huitzo/consent.jsonl) by the launcher binary itself on its first-run
+# bootstrap (the HUITZO_BOOTSTRAP_CONSENTED path), so the audit trail always
+# exists even though this script does not write the ledger.
 consent_gate() {
     echo ""
     echo "  Huitzo is about to download and install the Huitzo launcher + CLI"
@@ -72,8 +77,11 @@ consent_gate() {
 
     # Tell the launcher's first-run bootstrap that consent was already given,
     # so the user is asked exactly once (not again on first 'huitzo' run).
+    # The launcher records the GRANT on this path — no install without an
+    # audit trail. We deliberately do NOT export a session-wide
+    # HUITZO_ASSUME_YES: this consent covers only the bootstrap install, and
+    # the capability check that follows is read-only (installs nothing).
     export HUITZO_BOOTSTRAP_CONSENTED=1
-    export HUITZO_ASSUME_YES="${HUITZO_ASSUME_YES:-1}"
 }
 
 detect_platform() {

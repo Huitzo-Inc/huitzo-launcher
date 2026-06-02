@@ -215,7 +215,18 @@ fn probe_version(bin: &std::path::Path, args: &[&str]) -> Option<String> {
     }
 
     let text = String::from_utf8_lossy(&output.stdout);
-    let first_line = text.lines().next()?.trim();
+    parse_version_token(&text)
+}
+
+/// Extract a version-looking token from a tool's `--version` stdout.
+///
+/// Returns the first whitespace token on the first non-empty line that
+/// starts with an ASCII digit (handles `git version 2.43.0`, `claude 1.2.3`,
+/// `huitzo 0.5.2`). Falls back to the trimmed first line if no digit-led
+/// token exists; returns `None` only when there is no non-empty line. Pure +
+/// side-effect-free so it is unit-testable without spawning a process.
+fn parse_version_token(stdout: &str) -> Option<String> {
+    let first_line = stdout.lines().next()?.trim();
     if first_line.is_empty() {
         return None;
     }
@@ -365,6 +376,33 @@ mod tests {
     #[test]
     fn classify_windows_wsl_supported() {
         assert_eq!(classify_support("windows", true).0, SupportLevel::Supported);
+    }
+
+    #[test]
+    fn parse_version_token_extracts_digit_led_token() {
+        // git emits "git version 2.43.0"
+        assert_eq!(
+            parse_version_token("git version 2.43.0\n").as_deref(),
+            Some("2.43.0")
+        );
+        // claude / huitzo emit a bare "1.2.3" style line
+        assert_eq!(parse_version_token("2.1.159").as_deref(), Some("2.1.159"));
+        assert_eq!(
+            parse_version_token("huitzo 0.5.2\nextra\n").as_deref(),
+            Some("0.5.2")
+        );
+    }
+
+    #[test]
+    fn parse_version_token_falls_back_then_none() {
+        // No digit-led token anywhere → fall back to the trimmed first line.
+        assert_eq!(
+            parse_version_token("unknown tool build").as_deref(),
+            Some("unknown tool build")
+        );
+        // No non-empty line → None.
+        assert_eq!(parse_version_token(""), None);
+        assert_eq!(parse_version_token("   \n"), None);
     }
 
     #[test]

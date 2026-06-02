@@ -81,10 +81,26 @@ pub fn record(action: &str, description: &str, decision: Decision) -> std::io::R
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     line.push('\n');
 
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)?;
+    // This is an audit ledger — restrict to owner-only (0600) on Unix when
+    // the file is first created. `.mode()` only applies on creation, so an
+    // existing ledger keeps its mode; we tighten it explicitly below to
+    // self-heal a pre-existing world-readable file.
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(&path)?;
+
+    // Self-heal: ensure an already-existing ledger is owner-only too.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+
     file.write_all(line.as_bytes())
 }
 
@@ -146,6 +162,33 @@ pub fn prompt(action: &str, description: &str) -> bool {
         eprintln!("  Declined. No third-party software was installed.");
     }
     granted
+}
+
+/// Stable action id + description for the bootstrap install consent record.
+pub const BOOTSTRAP_ACTION: &str = "bootstrap_install";
+pub const BOOTSTRAP_DESC: &str = "download and install the Huitzo CLI into a managed environment";
+
+/// Resolve consent for the bootstrap install, ALWAYS leaving an audit trail.
+///
+/// Two paths, and the invariant "no install without a recorded grant" holds
+/// on both:
+///   - `HUITZO_BOOTSTRAP_CONSENTED=1`: the consent prompt was already shown
+///     upstream by `install.sh` / `install.ps1`. We do NOT skip silently —
+///     we record the grant here (the install scripts do not write the ledger
+///     themselves) and return `true`.
+///   - otherwise: prompt the user (which records grant AND decline) and
+///     return whether it was granted.
+///
+/// Returns `true` to proceed with the install, `false` if the user declined.
+pub fn resolve_bootstrap_consent() -> bool {
+    if std::env::var("HUITZO_BOOTSTRAP_CONSENTED").as_deref() == Ok("1") {
+        // Best-effort ledger write; never block the install on durability.
+        if let Err(e) = record(BOOTSTRAP_ACTION, BOOTSTRAP_DESC, Decision::Grant) {
+            eprintln!("  Warning: could not write consent ledger entry: {e}");
+        }
+        return true;
+    }
+    prompt(BOOTSTRAP_ACTION, BOOTSTRAP_DESC)
 }
 
 /// Explicit non-interactive consent override (operator-scripted installs).
@@ -258,5 +301,60 @@ mod tests {
             serde_json::to_string(&Decision::Decline).unwrap(),
             "\"decline\""
         );
+    }
+
+    // BLOCKER-1 regression: HUITZO_BOOTSTRAP_CONSENTED=1 must NOT install
+    // silently — it must leave a recorded Grant audit trail.
+    #[test]
+    fn bootstrap_consented_path_records_a_grant() {
+        let _g = LEDGER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        // SAFETY: serialized by LEDGER_LOCK.
+        unsafe {
+            std::env::set_var("HUITZO_HOME", tmp.path());
+            std::env::set_var("HUITZO_BOOTSTRAP_CONSENTED", "1");
+        }
+
+        let proceed = resolve_bootstrap_consent();
+        assert!(proceed, "BOOTSTRAP_CONSENTED=1 must proceed");
+
+        // A Grant record for the bootstrap action MUST exist.
+        let contents = std::fs::read_to_string(ledger_path())
+            .expect("ledger must be written on the BOOTSTRAP_CONSENTED path");
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 1, "exactly one grant recorded");
+        let rec: ConsentRecord = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(rec.action, BOOTSTRAP_ACTION);
+        assert_eq!(rec.decision, Decision::Grant);
+
+        unsafe {
+            std::env::remove_var("HUITZO_BOOTSTRAP_CONSENTED");
+            std::env::remove_var("HUITZO_HOME");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ledger_is_owner_only_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _g = LEDGER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("HUITZO_HOME", tmp.path()) };
+
+        record(
+            "bootstrap_install",
+            "install the Huitzo CLI",
+            Decision::Grant,
+        )
+        .unwrap();
+        let mode = std::fs::metadata(ledger_path())
+            .unwrap()
+            .permissions()
+            .mode();
+        // Mask to the permission bits; must be exactly owner read/write.
+        assert_eq!(mode & 0o777, 0o600, "consent ledger must be 0600");
+
+        unsafe { std::env::remove_var("HUITZO_HOME") };
     }
 }

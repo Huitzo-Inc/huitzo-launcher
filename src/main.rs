@@ -261,20 +261,16 @@ fn bootstrap() -> Result<(), Error> {
     eprintln!("Setting up huitzo environment...");
 
     // Logged informed consent before installing/executing third-party
-    // software (S29 pattern). Skipped only when the user already consented
-    // to this launcher's install — the install.sh / install.ps1 bootstrap
-    // sets HUITZO_BOOTSTRAP_CONSENTED=1 after recording consent up front, so
-    // the user is asked exactly once per bootstrap rather than twice.
-    if std::env::var("HUITZO_BOOTSTRAP_CONSENTED").as_deref() != Ok("1") {
-        let granted = consent::prompt(
-            "bootstrap_install",
-            "download and install the Huitzo CLI into a managed environment",
-        );
-        if !granted {
-            return Err(Error::PipInstall(
-                "Installation declined by user. No software was installed.".to_string(),
-            ));
-        }
+    // software (S29 pattern). The invariant is "no install without a
+    // recorded grant; always an audit trail" — it MUST hold on every path:
+    //   (A) HUITZO_BOOTSTRAP_CONSENTED=1 non-TTY,
+    //   (D) install.sh happy path (BOOTSTRAP_CONSENTED + ASSUME_YES),
+    //   (E) plain `huitzo <cmd>` with the var inherited.
+    // resolve_bootstrap_consent() records the grant on every proceed path
+    // (including the BOOTSTRAP_CONSENTED branch) and only returns false on a
+    // deliberate decline.
+    if !consent::resolve_bootstrap_consent() {
+        return Err(Error::ConsentDeclined);
     }
 
     let candidates = python::discover_all()?;

@@ -54,10 +54,13 @@ if ($env:HUITZO_ASSUME_YES -eq "1") {
         exit 1
     }
 }
-# The launcher records the consent decision in its local metadata-only ledger
-# on first run; signal that up-front consent was already obtained.
+# Signal that up-front consent was already obtained. On this path the
+# launcher records the GRANT to its local, metadata-only consent ledger
+# (~/.huitzo/consent.jsonl) on first run — no install without an audit trail.
+# We do NOT blanket-set HUITZO_ASSUME_YES: this consent covers only the
+# bootstrap install, and the BOOTSTRAP_CONSENTED path proceeds + records on
+# its own without needing the non-interactive override.
 $env:HUITZO_BOOTSTRAP_CONSENTED = "1"
-$env:HUITZO_ASSUME_YES = if ($env:HUITZO_ASSUME_YES) { $env:HUITZO_ASSUME_YES } else { "1" }
 
 # 1. Fetch latest launcher release
 Write-Step "Fetching latest release..."

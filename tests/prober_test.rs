@@ -6,7 +6,9 @@
 //!
 //! Roadmap: docs/roadmaps/huitzo-studio.md row S55.
 
-use huitzo_launcher::prober::{self, REPORT_SCHEMA_VERSION, SupportLevel};
+use huitzo_launcher::prober::{
+    self, CapabilityReport, HostInfo, REPORT_SCHEMA_VERSION, SupportLevel, ToolProbe,
+};
 
 #[test]
 fn probe_emits_three_required_tools_with_stable_ids() {
@@ -66,4 +68,61 @@ fn ready_matches_missing_required_emptiness() {
     let report = prober::probe();
     // Internal consistency: ready() iff there are no missing required tools.
     assert_eq!(report.ready(), report.missing_required().is_empty());
+}
+
+/// Build a synthetic MIXED-state report so readiness/gap derivations are
+/// asserted directly rather than relying on the (uniform) CI runner state.
+fn synthetic_report(tools: Vec<ToolProbe>) -> CapabilityReport {
+    CapabilityReport {
+        schema_version: REPORT_SCHEMA_VERSION,
+        launcher_version: "0.0.0-test".to_string(),
+        host: HostInfo {
+            os: "linux".to_string(),
+            arch: "x86_64".to_string(),
+            shell: Some("bash".to_string()),
+            wsl: false,
+            support: SupportLevel::Supported,
+            unsupported_reason: None,
+        },
+        tools,
+    }
+}
+
+fn tool(id: &str, present: bool, required: bool) -> ToolProbe {
+    ToolProbe {
+        id: id.to_string(),
+        display_name: id.to_string(),
+        present,
+        path: present.then(|| format!("/usr/bin/{id}")),
+        version: present.then(|| "1.0.0".to_string()),
+        required,
+        install_hint: (!present).then(|| format!("install {id}")),
+    }
+}
+
+#[test]
+fn mixed_report_ready_and_gaps_are_exact() {
+    // One required-missing → not ready, that one is the only gap.
+    let r = synthetic_report(vec![
+        tool("huitzo", true, true),
+        tool("claude", true, true),
+        tool("git", false, true),
+    ]);
+    assert!(!r.ready());
+    assert_eq!(r.missing_required(), vec!["git".to_string()]);
+
+    // An OPTIONAL tool missing must NOT block readiness.
+    let r = synthetic_report(vec![
+        tool("huitzo", true, true),
+        tool("claude", true, true),
+        tool("git", true, true),
+        tool("optional-extra", false, false),
+    ]);
+    assert!(r.ready(), "missing optional tool must not block readiness");
+    assert!(r.missing_required().is_empty());
+
+    // All required present → ready, no gaps.
+    let r = synthetic_report(vec![tool("huitzo", true, true), tool("git", true, true)]);
+    assert!(r.ready());
+    assert!(r.missing_required().is_empty());
 }

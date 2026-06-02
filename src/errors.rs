@@ -21,6 +21,11 @@ pub enum Error {
     TrustViolation { stored: String, advertised: String },
     /// Bundle integrity / signature verification failed.
     BundleVerify { reason: String },
+    /// User declined the informed-consent prompt before a third-party
+    /// install/exec. A deliberate user choice, NOT a failure — rendered and
+    /// exit-coded distinctly from install/network errors so scripts can tell
+    /// "user declined" from "install broke".
+    ConsentDeclined,
 }
 
 impl fmt::Display for Error {
@@ -67,6 +72,10 @@ impl fmt::Display for Error {
                 "Bundle verification failed: {reason}\n\n\
                  Refusing to install untrusted bundle."
             ),
+            Error::ConsentDeclined => write!(
+                f,
+                "Installation declined. No third-party software was installed."
+            ),
         }
     }
 }
@@ -89,5 +98,8 @@ pub fn exit_code(err: &Error) -> i32 {
         Error::Exec(_) => 126,              // Command found but not executable
         Error::TrustViolation { .. } => 77, // EX_NOPERM
         Error::BundleVerify { .. } => 77,   // EX_NOPERM
+        // Deliberate user decline — distinct from install/network failures
+        // (69) so scripts can branch on "user declined" vs "install broke".
+        Error::ConsentDeclined => 70, // EX_SOFTWARE-adjacent slot, reserved here for user-decline
     }
 }
