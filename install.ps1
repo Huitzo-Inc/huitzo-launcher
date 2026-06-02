@@ -1,9 +1,19 @@
 # Huitzo CLI Installer — Windows (PowerShell 5.1+)
 # Usage: iwr -useb https://raw.githubusercontent.com/Huitzo-Inc/huitzo-launcher/main/install.ps1 | iex
 #
+# IMPORTANT: Native Windows (non-WSL) is NOT yet officially supported for the
+# Huitzo Studio runner. The OFFICIAL one-command bootstrap targets macOS,
+# Linux, and WSL2 via install.sh. This script remains for advanced users who
+# want the launcher binary on native Windows, but you should prefer WSL2:
+#   wsl --install -d Ubuntu
+#   # then, inside Ubuntu:
+#   curl -sSf https://raw.githubusercontent.com/Huitzo-Inc/huitzo-launcher/main/install.sh | sh
+# See docs/SUPPORT_MATRIX.md for the honest support matrix and rationale.
+#
 # Environment variables:
 #   HUITZO_HOME            — override install root (default: $env:USERPROFILE\.huitzo)
 #   HUITZO_NO_MODIFY_PATH  — set to 1 to skip PATH modification
+#   HUITZO_ASSUME_YES      — set to 1 to grant install consent non-interactively
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $ErrorActionPreference = "Stop"
@@ -24,6 +34,33 @@ function Write-Fail { param($msg) Write-Host "Error: $msg" -ForegroundColor Red;
 
 Write-Host ""
 Write-Host "==> Installing Huitzo CLI" -ForegroundColor White
+
+# --- Honest support matrix: native Windows is not yet officially supported ---
+Write-Warn "Native Windows (non-WSL) is NOT yet officially supported for the"
+Write-Warn "Huitzo Studio runner. The recommended path is WSL2 (Ubuntu) + install.sh."
+Write-Warn "See docs/SUPPORT_MATRIX.md. Continuing will install the launcher binary,"
+Write-Warn "but runner pairing may not work on native Windows."
+
+# --- Logged informed consent before any third-party install/exec (S29) ---
+Write-Host ""
+Write-Host "  Huitzo is about to download and install the Huitzo launcher + CLI." -ForegroundColor White
+Write-Host "  This installs/executes third-party software. Nothing is uploaded." -ForegroundColor White
+if ($env:HUITZO_ASSUME_YES -eq "1") {
+    Write-Step "HUITZO_ASSUME_YES=1 — proceeding with recorded consent."
+} else {
+    $answer = Read-Host "  Proceed? [y/N]"
+    if ($answer -notmatch '^(y|yes)$') {
+        Write-Host "  Declined. Nothing was installed." -ForegroundColor Yellow
+        exit 1
+    }
+}
+# Signal that up-front consent was already obtained. On this path the
+# launcher records the GRANT to its local, metadata-only consent ledger
+# (~/.huitzo/consent.jsonl) on first run — no install without an audit trail.
+# We do NOT blanket-set HUITZO_ASSUME_YES: this consent covers only the
+# bootstrap install, and the BOOTSTRAP_CONSENTED path proceeds + records on
+# its own without needing the non-interactive override.
+$env:HUITZO_BOOTSTRAP_CONSENTED = "1"
 
 # 1. Fetch latest launcher release
 Write-Step "Fetching latest release..."
@@ -119,7 +156,17 @@ if ($env:HUITZO_NO_MODIFY_PATH -ne "1") {
     }
 }
 
-# 8. Done
+# 8. Capability check (in-launcher prober) — one command finishes by telling
+#    the user what is present and what is still missing.
+Write-Host ""
+Write-Host "==> Checking local capabilities" -ForegroundColor White
+try {
+    & $BinaryPath --launcher-detect --human
+} catch {
+    Write-Warn "Capability check could not run: $_"
+}
+
+# 9. Done
 Write-Host ""
 Write-Host "✓ Huitzo CLI installed successfully!" -ForegroundColor Green
 Write-Host ""
