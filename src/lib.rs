@@ -7,8 +7,10 @@
 
 pub mod bundle;
 pub mod capabilities;
+pub mod consent;
 pub mod dirs;
 pub mod download;
 pub mod errors;
 pub mod keys;
 pub mod manifest;
+pub mod prober;

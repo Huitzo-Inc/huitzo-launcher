@@ -1,5 +1,6 @@
 mod bundle;
 mod capabilities;
+mod consent;
 mod dirs;
 mod download;
 mod errors;
@@ -7,6 +8,7 @@ mod exec;
 mod install;
 mod keys;
 mod manifest;
+mod prober;
 mod python;
 mod update;
 mod venv;
@@ -21,6 +23,28 @@ fn main() {
     if args.iter().any(|a| a == "--launcher-version") {
         println!("huitzo-launcher {}", env!("CARGO_PKG_VERSION"));
         return;
+    }
+
+    // Capability prober (S55): emit the local prerequisite report consumed
+    // by S56's Hub onboarding rail. `--launcher-detect` prints JSON to
+    // stdout for machine consumption; `--launcher-detect --human` prints a
+    // readable summary. The exit code is 0 when all required tools are
+    // present, 1 when a required gap is open — so a script can branch on it.
+    if args.iter().any(|a| a == "--launcher-detect") {
+        let human = args.iter().any(|a| a == "--human");
+        let report = prober::probe();
+        if human {
+            print_detect_human(&report);
+        } else {
+            match serde_json::to_string_pretty(&report) {
+                Ok(json) => println!("{json}"),
+                Err(e) => {
+                    eprintln!("Error: failed to serialize capability report: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        std::process::exit(if report.ready() { 0 } else { 1 });
     }
 
     if args.iter().any(|a| a == "--launcher-bootstrap") {
@@ -235,6 +259,23 @@ fn run_with(args: Vec<String>, force_trust_rotate: bool) {
 /// wheels exist and Python 3.12 is also available.
 fn bootstrap() -> Result<(), Error> {
     eprintln!("Setting up huitzo environment...");
+
+    // Logged informed consent before installing/executing third-party
+    // software (S29 pattern). Skipped only when the user already consented
+    // to this launcher's install — the install.sh / install.ps1 bootstrap
+    // sets HUITZO_BOOTSTRAP_CONSENTED=1 after recording consent up front, so
+    // the user is asked exactly once per bootstrap rather than twice.
+    if std::env::var("HUITZO_BOOTSTRAP_CONSENTED").as_deref() != Ok("1") {
+        let granted = consent::prompt(
+            "bootstrap_install",
+            "download and install the Huitzo CLI into a managed environment",
+        );
+        if !granted {
+            return Err(Error::PipInstall(
+                "Installation declined by user. No software was installed.".to_string(),
+            ));
+        }
+    }
 
     let candidates = python::discover_all()?;
 
@@ -460,6 +501,52 @@ fn detect_install_source() -> (String, Option<String>) {
         }
     }
     ("pypi".to_string(), None)
+}
+
+/// Render the capability report as a human-readable terminal summary for
+/// `huitzo --launcher-detect --human`. Machine consumers use the default
+/// JSON form; this is for a person eyeballing their environment.
+fn print_detect_human(report: &prober::CapabilityReport) {
+    println!(
+        "Huitzo capability check (launcher {})",
+        report.launcher_version
+    );
+    println!(
+        "  Host: {} ({}){}",
+        report.host.os,
+        report.host.arch,
+        if report.host.wsl { " [WSL]" } else { "" }
+    );
+    match report.host.support {
+        prober::SupportLevel::Supported => println!("  Support: supported"),
+        prober::SupportLevel::Unsupported => {
+            println!("  Support: NOT yet supported");
+            if let Some(reason) = &report.host.unsupported_reason {
+                println!("    {reason}");
+            }
+        }
+    }
+    println!();
+    for tool in &report.tools {
+        let mark = if tool.present { "[ok]" } else { "[--]" };
+        let version = tool.version.as_deref().unwrap_or("");
+        let req = if tool.required { " (required)" } else { "" };
+        println!("  {mark} {}{req} {version}", tool.display_name);
+        if !tool.present {
+            if let Some(hint) = &tool.install_hint {
+                println!("        install: {hint}");
+            }
+        }
+    }
+    println!();
+    if report.ready() {
+        println!("All required tools present — this machine is ready to pair a runner.");
+    } else {
+        println!(
+            "Missing required tools: {}. Install them, then re-run the check.",
+            report.missing_required().join(", ")
+        );
+    }
 }
 
 /// Helper to clone manifest data for update (avoids requiring Clone on Manifest).
