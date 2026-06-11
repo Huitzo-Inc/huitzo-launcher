@@ -11,8 +11,31 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Gate (#916): the launcher self-reports env!("CARGO_PKG_VERSION"), so a tag
+  # built from a stale Cargo.toml ships a binary that forever sees itself as
+  # outdated — an infinite self-update loop that also shadows the CLI-wheel
+  # update check. Refuse to build unless Cargo.toml matches the tag exactly.
+  verify-version:
+    name: Verify Cargo.toml version == tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Compare Cargo.toml version against tag
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          CARGO_VERSION=$(grep -m1 '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+          echo "tag: ${TAG_VERSION}  Cargo.toml: ${CARGO_VERSION}"
+          if [ "${TAG_VERSION}" != "${CARGO_VERSION}" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${CARGO_VERSION}."
+            echo "::error::A binary built now would self-report v${CARGO_VERSION} and self-update forever (#916)."
+            echo "::error::Bump Cargo.toml (+ Cargo.lock) on main first, then re-tag."
+            exit 1
+          fi
+
   build:
     name: Build (${{ matrix.target }})
+    needs: verify-version
     strategy:
       matrix:
         include:
