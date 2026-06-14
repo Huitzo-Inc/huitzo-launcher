@@ -30,6 +30,29 @@ pub fn manifest_path() -> PathBuf {
     huitzo_home().join("manifest.json")
 }
 
+/// Returns the launcher-managed bin directory: `<huitzo_home>/bin/`.
+///
+/// Holds the launcher binary itself and (huitzo#965 / task #38) the bundled `uv`. This
+/// directory is prepended to `PATH` before exec so the CLI + its build subprocesses can
+/// resolve `uv`.
+pub fn bin_dir() -> PathBuf {
+    huitzo_home().join("bin")
+}
+
+/// Returns the staged uv binary path: `<huitzo_home>/bin/uv` (`uv.exe` on Windows).
+pub fn uv_bin() -> PathBuf {
+    let name = if cfg!(windows) { "uv.exe" } else { "uv" };
+    bin_dir().join(name)
+}
+
+/// Returns the uv version-stamp file: `<huitzo_home>/uv-version.txt`.
+///
+/// Records which pinned uv version is currently staged so a launch can short-circuit
+/// the download when uv is already current (idempotency).
+pub fn uv_version_stamp() -> PathBuf {
+    huitzo_home().join("uv-version.txt")
+}
+
 /// Returns the user's home directory, panicking if unavailable.
 pub fn home_dir_or_panic() -> PathBuf {
     dirs::home_dir().expect("Cannot determine home directory")

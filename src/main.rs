@@ -11,6 +11,8 @@ mod manifest;
 mod prober;
 mod python;
 mod update;
+mod uv;
+mod uv_manifest;
 mod venv;
 
 use errors::Error;
@@ -239,6 +241,14 @@ fn run_with(args: Vec<String>, force_trust_rotate: bool) {
     // (set by `huitzo config set api_url` / `huitzo login` on the Python
     // side). Trust violations + signature failures exit before exec.
     let _ = refresh_capabilities_if_needed(force_trust_rotate);
+
+    // 7.5 Ensure the bundled `uv` build tool is staged (huitzo#965 / task #38). Idempotent
+    // (skips when already current — no network), runs on every launch so existing installs
+    // pick it up. NON-FATAL: a missing uv must never brick the launcher — the runner
+    // reports the honest `build_tools_missing` in Studio instead.
+    if let Err(e) = uv::ensure_uv() {
+        eprintln!("Warning: uv setup failed (non-fatal): {e}");
+    }
 
     // 8. Exec into Python CLI (never returns on Unix)
     if let Err(e) = exec::exec_into_python(&dirs::venv_python(), &args) {
