@@ -1,6 +1,6 @@
 [package]
 name = "huitzo"
-version = "0.2.9"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Huitzo CLI launcher — manages Python environment and execs into huitzo_cli"
@@ -27,9 +27,16 @@ base64 = "0.22"
 url = "2"
 tar = "0.4"
 zstd = "0.13"
+# gzip for the Astral uv release archives (`.tar.gz`); pure-Rust miniz_oxide backend
+# (default) so it cross-compiles without a system zlib. huitzo#965 / task #38.
+flate2 = "1"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", features = ["process"] }
+
+# Windows uv release archive is a `.zip`; only needed there. Pure-Rust deflate.
+[target.'cfg(windows)'.dependencies]
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 httpmock = "0.7"

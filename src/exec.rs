@@ -10,12 +10,21 @@ use crate::errors::Error;
 /// Sets `HUITZO_MANAGED=1` so the Python CLI can detect it is running under
 /// the launcher (e.g., to suppress "run pip install --upgrade" messages).
 pub fn exec_into_python(venv_python: &Path, args: &[String]) -> Result<(), Error> {
-    // Signal to the Python CLI that it's running under the launcher.
-    // SAFETY: This is called from main() before any threads are spawned for
-    // the exec path (the background update thread is already detached and
-    // doesn't read this variable). On Unix, execvp replaces the process
-    // immediately after this point, so no concurrent access is possible.
-    unsafe { std::env::set_var("HUITZO_MANAGED", "1") };
+    // Signal to the Python CLI that it's running under the launcher, and make the
+    // bundled `uv` reachable (huitzo#965 / task #38): export HUITZO_HOME so the CLI can
+    // resolve `<huitzo_home>/bin/uv` ABSOLUTELY (it survives the runner's env-scrub,
+    // which forwards PATH but not HUITZO_HOME), and prepend `<huitzo_home>/bin` to PATH
+    // so a bare `uv` also resolves for the CLI and its build subprocesses.
+    //
+    // SAFETY: This is called from main() before any threads are spawned for the exec
+    // path (the background update thread is already detached and doesn't read these
+    // variables). On Unix, execvp replaces the process immediately after this point, so
+    // no concurrent access is possible.
+    unsafe {
+        std::env::set_var("HUITZO_MANAGED", "1");
+        std::env::set_var("HUITZO_HOME", crate::dirs::huitzo_home());
+        std::env::set_var("PATH", path_with_bin_dir_prepended());
+    }
 
     #[cfg(unix)]
     {
@@ -25,6 +34,23 @@ pub fn exec_into_python(venv_python: &Path, args: &[String]) -> Result<(), Error
     #[cfg(windows)]
     {
         exec_windows(venv_python, args)
+    }
+}
+
+/// The current `PATH` with `<huitzo_home>/bin` prepended (as a single front entry).
+///
+/// Prepending makes the launcher-bundled `uv` win over any older system uv, and the
+/// runner's env-scrub forwards `PATH`, so the build subprocess inherits it too.
+fn path_with_bin_dir_prepended() -> std::ffi::OsString {
+    let bin = crate::dirs::bin_dir();
+    match std::env::var_os("PATH") {
+        Some(existing) => {
+            let mut entries = vec![bin.clone()];
+            // Drop any pre-existing copy of our bin dir so it stays a single front entry.
+            entries.extend(std::env::split_paths(&existing).filter(|p| *p != bin));
+            std::env::join_paths(entries).unwrap_or(existing)
+        }
+        None => bin.into_os_string(),
     }
 }
 
