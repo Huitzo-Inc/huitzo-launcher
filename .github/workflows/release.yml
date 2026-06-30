@@ -19,7 +19,7 @@ jobs:
     name: Verify Cargo.toml version == tag
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Compare Cargo.toml version against tag
         run: |
@@ -60,7 +60,7 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -163,7 +163,7 @@ jobs:
           echo "version=${TAG#v}"                                               >> "$GITHUB_OUTPUT"
 
       - name: Checkout homebrew-tap
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: Huitzo-Inc/homebrew-tap
           token: ${{ secrets.TAP_UPDATE_TOKEN }}
