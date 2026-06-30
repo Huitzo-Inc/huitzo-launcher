@@ -36,10 +36,10 @@ nix = { version = "0.31", features = ["process"] }
 
 # Windows uv release archive is a `.zip`; only needed there. Pure-Rust deflate.
 [target.'cfg(windows)'.dependencies]
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "7", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
-httpmock = "0.7"
+httpmock = "0.8"
 tempfile = "3"
 rand = "0.8"
 
