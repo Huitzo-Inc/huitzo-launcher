@@ -4,7 +4,7 @@ version = "0.3.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Huitzo CLI launcher — manages Python environment and execs into huitzo_cli"
-license = "Proprietary"
+license-file = "LICENSE"
 repository = "https://github.com/Huitzo-Inc/huitzo-launcher"
 
 [lib]

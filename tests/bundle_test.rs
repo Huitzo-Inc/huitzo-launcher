@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Huitzo Inc. All rights reserved.
+// SPDX-License-Identifier: LicenseRef-Huitzo-Source-Available
+
 //! Integration tests for the bundle fetch + verify + stage path.
 
 mod common;

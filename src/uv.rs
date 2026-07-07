@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Huitzo Inc. All rights reserved.
+// SPDX-License-Identifier: LicenseRef-Huitzo-Source-Available
+
 //! Bundle the pinned `uv` build tool for the Studio runner (huitzo#965 / task #38).
 //!
 //! A launcher-only, non-technical user has no `uv`. The runner needs it to build a pack

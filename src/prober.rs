@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Huitzo Inc. All rights reserved.
+// SPDX-License-Identifier: LicenseRef-Huitzo-Source-Available
+
 //! In-launcher capability prober.
 //!
 //! Detects the local prerequisites a Huitzo Studio runner needs — the

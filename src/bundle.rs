@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Huitzo Inc. All rights reserved.
+// SPDX-License-Identifier: LicenseRef-Huitzo-Source-Available
+
 //! SDK bundle download + verify + extract.
 //!
 //! The deployment bundle is a signed `.tar.zst` envelope (ADR-001)

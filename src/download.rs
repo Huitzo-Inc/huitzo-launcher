@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Huitzo Inc. All rights reserved.
+// SPDX-License-Identifier: LicenseRef-Huitzo-Source-Available
+
 use crate::dirs;
 use crate::errors::Error;
 use sha2::{Digest, Sha256};

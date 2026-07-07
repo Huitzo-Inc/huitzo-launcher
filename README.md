@@ -97,4 +97,10 @@ cargo build --release
 
 ## License
 
-Proprietary - Huitzo Inc.
+Source-available under the **Huitzo Source-Available License** — see
+[LICENSE](LICENSE). The source is public for transparency and installation;
+copying, modification, and redistribution require written permission from
+Huitzo Inc.
+
+"Huitzo" and the Huitzo logo are trademarks of Huitzo Inc. — see
+[TRADEMARKS.md](TRADEMARKS.md).
