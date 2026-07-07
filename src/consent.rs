@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Huitzo Inc. All rights reserved.
+// SPDX-License-Identifier: LicenseRef-Huitzo-Source-Available
+
 //! Logged informed consent before any third-party install/exec.
 //!
 //! The one-command bootstrap installs/execs third-party binaries (the

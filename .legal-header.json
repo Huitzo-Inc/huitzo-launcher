@@ -1,0 +1,11 @@
+{
+  "schema": 1,
+  "license-id": "LicenseRef-Huitzo-Source-Available",
+  "copyright-holder": "Huitzo Inc.",
+  "exclude": [
+    "scripts/check_legal_headers.py"
+  ],
+  "metadata-files": [
+    "Cargo.toml"
+  ]
+}

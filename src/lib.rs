@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Huitzo Inc. All rights reserved.
+// SPDX-License-Identifier: LicenseRef-Huitzo-Source-Available
+
 //! Huitzo launcher library surface.
 //!
 //! This crate normally ships as the `huitzo` binary (see `src/main.rs`).

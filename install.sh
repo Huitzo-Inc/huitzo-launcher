@@ -1,4 +1,7 @@
 #!/bin/sh
+# Copyright (c) 2026 Huitzo Inc. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-Huitzo-Source-Available
+
 # Huitzo CLI — one-command bootstrap (Linux, macOS, WSL)
 # Usage: curl -sSf https://raw.githubusercontent.com/Huitzo-Inc/huitzo-launcher/main/install.sh | sh
 #

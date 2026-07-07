@@ -1,0 +1,31 @@
+Huitzo Source-Available License
+SPDX-License-Identifier: LicenseRef-Huitzo-Source-Available
+
+Copyright (c) 2026 Huitzo Inc. All rights reserved.
+
+This software and its accompanying documentation (the "Software") are the
+proprietary property of Huitzo Inc. ("Huitzo"). The source code is made
+publicly visible for transparency, security review, and to support
+installation of Huitzo products.
+
+Permission is hereby granted to view the Software's source code and to
+download and execute unmodified copies of the Software solely to install and
+use Huitzo products.
+
+EXCEPT AS EXPRESSLY PERMITTED ABOVE, NO LICENSE IS GRANTED. You may not
+copy, reproduce, modify, adapt, translate, publish, distribute, sublicense,
+sell, or create derivative works of the Software, in whole or in part,
+without the prior written permission of Huitzo.
+
+Public visibility of this repository does not grant any right or license,
+express or implied, to any Huitzo intellectual property, including patents,
+copyrights, trademarks, or trade secrets. See TRADEMARKS.md for trademark
+terms.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+HUITZO BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY ARISING FROM OR
+IN CONNECTION WITH THE SOFTWARE OR ITS USE.
+
+For licensing inquiries: legal@huitzo.ai

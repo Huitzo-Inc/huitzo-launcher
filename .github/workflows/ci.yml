@@ -51,3 +51,9 @@ jobs:
 
       - name: Clippy
         run: cargo clippy -- -D warnings
+
+      # IP protection: every source file carries the legal header (copyright +
+      # SPDX LicenseRef-Huitzo-Source-Available). Vendored checker; policy in
+      # the parent repo (docs/governance/ip-protection.md).
+      - name: Legal headers
+        run: python3 scripts/check_legal_headers.py

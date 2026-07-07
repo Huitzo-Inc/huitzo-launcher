@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Huitzo Inc. All rights reserved.
+// SPDX-License-Identifier: LicenseRef-Huitzo-Source-Available
+
 //! Pinned `uv` release manifest — the compiled-in trust anchor for bundling uv.
 //!
 //! The Studio runner builds packs with `uv` (the gates run `uv run`; the build runs
