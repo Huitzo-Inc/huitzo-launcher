@@ -1,4 +1,4 @@
-# Huitzo CLI Installer — Windows (PowerShell 5.1+)
+﻿# Huitzo CLI Installer — Windows (PowerShell 5.1+)
 # Usage: iwr -useb https://raw.githubusercontent.com/Huitzo-Inc/huitzo-launcher/main/install.ps1 | iex
 #
 # IMPORTANT: Native Windows (non-WSL) is NOT yet officially supported for the
@@ -117,7 +117,13 @@ try {
 if ($sha256Info) {
     Write-Step "Verifying checksum..."
     try {
-        $checksumContent = (Invoke-WebRequest -Uri $sha256Info.browser_download_url -UseBasicParsing).Content.Trim()
+        # Invoke-RestMethod returns a decoded String on both Windows PowerShell 5.1
+        # and PowerShell 7. (Invoke-WebRequest's .Content is a Byte[] on 5.1, so .Trim()
+        # would throw there — which previously got downgraded to a warning and SKIPPED
+        # verification, installing an UNVERIFIED binary.) The [string] cast keeps the
+        # normal string case a no-op while forcing any unexpected non-string into a
+        # (fatal) mismatch/verification failure below rather than a silent skip.
+        $checksumContent = ([string](Invoke-RestMethod -Uri $sha256Info.browser_download_url -UseBasicParsing)).Trim()
         $expected = ($checksumContent -split '\s+')[0].ToLower()
         $actual   = (Get-FileHash -Path $TmpFile -Algorithm SHA256).Hash.ToLower()
         if ($actual -ne $expected) {
@@ -126,7 +132,12 @@ if ($sha256Info) {
         }
         Write-Ok "Checksum OK"
     } catch {
-        Write-Warn "Could not verify checksum (non-fatal): $_"
+        # A failure to FETCH or PARSE the checksum must NOT silently proceed: refuse
+        # to install an unverified binary (#39). This is fatal. The legitimate
+        # "no .sha256 asset present" case is still handled by the else-branch below,
+        # which may warn-and-continue.
+        Remove-Item $TmpFile -Force -ErrorAction SilentlyContinue
+        Write-Fail "Checksum verification failed — refusing to install unverified binary: $_"
     }
 } else {
     Write-Warn "No checksum file found for this release — skipping verification."
@@ -165,6 +176,11 @@ try {
 } catch {
     Write-Warn "Capability check could not run: $_"
 }
+# The capability probe is informational only, but it exits non-zero on native
+# Windows / when an optional tool (e.g. claude) is missing. Left as-is it would
+# leak into the script's exit code (#40) — as would any residual $LASTEXITCODE
+# from the earlier best-effort pip probe. Reset before the success banner.
+$LASTEXITCODE = 0
 
 # 9. Done
 Write-Host ""
@@ -176,3 +192,8 @@ Write-Host ""
 Write-Host "  On first run the launcher will automatically download" -ForegroundColor DarkGray
 Write-Host "  the latest CLI package for your platform." -ForegroundColor DarkGray
 Write-Host ""
+
+# End the success path with an explicit success code so a non-zero $LASTEXITCODE
+# from the informational capability probe (or any earlier best-effort external
+# call) can never mask a successful install (#40).
+exit 0
