@@ -25,6 +25,14 @@ consent before installing any third-party software.
 curl -sSf https://raw.githubusercontent.com/Huitzo-Inc/huitzo-launcher/main/install.sh | sh
 ```
 
+Run in a terminal, this prompts for consent before installing. For
+non-interactive environments (CI, containers, provisioning scripts), grant
+consent up front with `HUITZO_ASSUME_YES=1`:
+
+```sh
+curl -sSf https://raw.githubusercontent.com/Huitzo-Inc/huitzo-launcher/main/install.sh | HUITZO_ASSUME_YES=1 sh
+```
+
 ### Homebrew (macOS)
 
 ```sh
