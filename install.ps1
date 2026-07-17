@@ -1,4 +1,4 @@
-# Huitzo CLI Installer — Windows (PowerShell 5.1+)
+﻿# Huitzo CLI Installer — Windows (PowerShell 5.1+)
 # Usage: iwr -useb https://raw.githubusercontent.com/Huitzo-Inc/huitzo-launcher/main/install.ps1 | iex
 #
 # IMPORTANT: Native Windows (non-WSL) is NOT yet officially supported for the
