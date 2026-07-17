@@ -62,20 +62,39 @@ consent_gate() {
     echo "  onto this machine, and will detect git and your AI tool (Claude Code)."
     echo "  This installs/executes third-party software. Nothing is uploaded."
 
+    answer=""
     if [ "${HUITZO_ASSUME_YES:-0}" = "1" ]; then
         echo "  HUITZO_ASSUME_YES=1 — proceeding with recorded consent."
-    elif [ -t 0 ]; then
-        printf '  Proceed? [y/N] '
-        read -r answer
+    else
+        # Read consent from the controlling terminal. With the documented
+        # `curl ... | sh` invocation sh's stdin is the script pipe (not a TTY),
+        # so [ -t 0 ] is false and we must prompt on /dev/tty; fall back to
+        # stdin when it is itself a TTY. Only a genuinely non-interactive run
+        # (CI, `docker run` without -t, no controlling terminal) fails closed.
+        #
+        # A bare [ -r /dev/tty ] passes even with no controlling terminal (the
+        # later read then fails), so probe that /dev/tty can actually be OPENED.
+        # `true` (a regular builtin) is used on purpose: unlike `exec`, a
+        # redirect failure here won't abort a `set -e` POSIX shell.
+        consent_tty=0
+        # shellcheck disable=SC2217
+        if { true < /dev/tty; } 2>/dev/null; then consent_tty=1; fi
+
+        if [ -t 0 ]; then
+            printf '  Proceed? [y/N] '
+            read -r answer || answer=""
+        elif [ "$consent_tty" = "1" ]; then
+            printf '  Proceed? [y/N] ' > /dev/tty
+            read -r answer < /dev/tty || answer=""
+        else
+            echo "  No interactive terminal detected. Re-run with HUITZO_ASSUME_YES=1"
+            echo "  to consent non-interactively, or run the command in a terminal."
+            exit 1
+        fi
         case "$answer" in
             y|Y|yes|YES) : ;;
             *) echo "  Declined. Nothing was installed."; exit 1 ;;
         esac
-    else
-        # Piped (curl | sh) with no TTY and no explicit override: fail closed.
-        echo "  No interactive terminal detected. Re-run with HUITZO_ASSUME_YES=1"
-        echo "  to consent non-interactively, or run the command in a terminal."
-        exit 1
     fi
 
     # Tell the launcher's first-run bootstrap that consent was already given,
