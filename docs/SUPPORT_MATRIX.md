@@ -25,20 +25,41 @@ code cannot silently diverge.
 A machine in the supported set with all three required tools present
 (`huitzo`, `claude`, `git`) is **ready to pair a runner**.
 
-## NOT yet supported
+## Native Windows (PowerShell) — CLI supported, runner on WSL2
+
+The Huitzo **CLI** installs and runs on native Windows via the PowerShell
+bootstrap:
+
+```powershell
+iwr -useb https://raw.githubusercontent.com/Huitzo-Inc/huitzo-launcher/main/install.ps1 | iex
+```
+
+`install.ps1` downloads the launcher, verifies its SHA-256 checksum, installs
+to `%USERPROFILE%\.huitzo\bin`, and adds it to your user `PATH`. CLI and pack
+development work natively.
+
+The Studio **runner**, however, requires WSL2: its outbound daemon and the
+launcher's POSIX `execvp` hand-off assume a POSIX shell + process model. To
+pair a local runner on a Windows machine, install into WSL2 (Ubuntu) and run
+the Linux bootstrap there. The prober therefore classifies native Windows off
+the runner matrix (`host.support = unsupported`) with a reason that spells this
+out.
+
+## Limitations
 
 | Environment | Status | Why |
 |-------------|--------|-----|
-| **Native Windows (non-WSL)** — `PowerShell` / `cmd` | **Unsupported** | The runner's outbound daemon, the launcher's POSIX `execvp` hand-off to the CLI, and the `curl \| sh` bootstrap all assume a POSIX shell + process model. Native-Windows process/PATH/signal semantics differ enough that we will not claim support until it is tested end-to-end. **Use WSL2 instead** — it is fully supported and is the documented Windows path. `install.ps1` will install the launcher binary but prints this warning and does not promise runner pairing. |
+| **Native Windows (non-WSL) — Studio runner** | **WSL2 only** (CLI runs natively) | The **CLI** installs and runs natively (see the section above). The Studio **runner** assumes a POSIX shell + process model — its outbound daemon, the launcher's `execvp` hand-off, and the `curl \| sh` bootstrap all target POSIX. To pair a local runner on Windows, install into **WSL2** (Ubuntu) and run the Linux bootstrap there. |
 | **Admin-locked / corporate-managed machines** | **Unsupported** | Locked-down corporate endpoints (no admin rights, MDM-enforced execution policy, mandatory EDR/antivirus that quarantines unsigned downloads, TLS-intercepting proxies, blocked package registries) break the install and/or the outbound runner channel in ways Huitzo cannot reliably detect or remediate from the launcher. The prober cannot positively identify "corporate-locked" from inside the process, so this is flagged in docs (and in onboarding copy) rather than auto-classified. Signed-binary distribution integrity that survives EDR is tracked separately as **S57** (`feat/runner-distribution-integrity`). |
 
 ## Classification rules (what the prober reports)
 
 `huitzo --launcher-detect` emits `host.support` as one of:
 
-- `supported` — macOS, Linux, or WSL2.
-- `unsupported` — native Windows (with a `unsupported_reason` pointing here),
-  or any OS not in the supported set.
+- `supported` — macOS, Linux, or WSL2 (ready to pair a runner).
+- `unsupported` — native Windows (the CLI runs, but the Studio runner needs
+  WSL2; the `unsupported_reason` says exactly that), or any OS not in the
+  supported set.
 
 Corporate-lock is **not** auto-detected (it is not reliably observable from
 the process); it is documented here and surfaced in onboarding copy so users

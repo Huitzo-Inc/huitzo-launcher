@@ -35,11 +35,10 @@ function Write-Fail { param($msg) Write-Host "Error: $msg" -ForegroundColor Red;
 Write-Host ""
 Write-Host "==> Installing Huitzo CLI" -ForegroundColor White
 
-# --- Honest support matrix: native Windows is not yet officially supported ---
-Write-Warn "Native Windows (non-WSL) is NOT yet officially supported for the"
-Write-Warn "Huitzo Studio runner. The recommended path is WSL2 (Ubuntu) + install.sh."
-Write-Warn "See docs/SUPPORT_MATRIX.md. Continuing will install the launcher binary,"
-Write-Warn "but runner pairing may not work on native Windows."
+# --- Honest support matrix: CLI runs natively; Studio runner requires WSL2 ---
+Write-Step "Native Windows: the Huitzo CLI installs and runs here."
+Write-Step "The Studio runner requires WSL2 (Ubuntu) -- if you plan to pair a"
+Write-Step "local runner, use WSL2 + install.sh. See docs/SUPPORT_MATRIX.md."
 
 # --- Logged informed consent before any third-party install/exec (S29) ---
 Write-Host ""

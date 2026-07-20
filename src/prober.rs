@@ -272,11 +272,13 @@ fn normalized_os() -> String {
 
 /// Apply the published OS/shell support matrix (docs/SUPPORT_MATRIX.md).
 ///
-/// Supported: macOS, Linux, and WSL. Native Windows (non-WSL) is explicitly
-/// UNSUPPORTED — the runner's outbound daemon, POSIX exec path, and the
-/// curl|sh bootstrap target a POSIX shell. Admin-locked corporate machines
-/// are called out in the matrix doc but cannot be reliably auto-detected
-/// from the launcher, so they are flagged in docs rather than here.
+/// Supported: macOS, Linux, and WSL. On native Windows (non-WSL) the CLI
+/// installs and runs, but the Studio *runner* requires WSL2 — its outbound
+/// daemon and POSIX exec path target a POSIX shell — so native Windows is
+/// classified off the runner matrix (`Unsupported`) with a reason that says
+/// exactly that. Admin-locked corporate machines are called out in the matrix
+/// doc but cannot be reliably auto-detected from the launcher, so they are
+/// flagged in docs rather than here.
 fn classify_support(os: &str, wsl: bool) -> (SupportLevel, Option<String>) {
     match os {
         "macos" | "linux" => (SupportLevel::Supported, None),
@@ -284,9 +286,9 @@ fn classify_support(os: &str, wsl: bool) -> (SupportLevel, Option<String>) {
         "windows" => (
             SupportLevel::Unsupported,
             Some(
-                "Native Windows (non-WSL) is not yet officially supported. \
-                 Install Huitzo inside WSL2 (Ubuntu) and run the bootstrap there. \
-                 See docs/SUPPORT_MATRIX.md."
+                "The Huitzo CLI installs and runs on native Windows. The Studio \
+                 runner requires WSL2 (Ubuntu) — install WSL2 and run the bootstrap \
+                 there to pair a runner. See docs/SUPPORT_MATRIX.md."
                     .to_string(),
             ),
         ),
