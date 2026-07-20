@@ -529,7 +529,7 @@ fn print_detect_human(report: &prober::CapabilityReport) {
     match report.host.support {
         prober::SupportLevel::Supported => println!("  Support: supported"),
         prober::SupportLevel::Unsupported => {
-            println!("  Support: NOT yet supported");
+            println!("  Support: not fully supported (see note)");
             if let Some(reason) = &report.host.unsupported_reason {
                 println!("    {reason}");
             }
