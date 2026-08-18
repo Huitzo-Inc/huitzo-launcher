@@ -23,7 +23,7 @@ sha2 = "0.11"
 dirs = "6"
 which = "8"
 ed25519-dalek = { version = "2", default-features = false, features = ["std", "rand_core"] }
-base64 = "0.22"
+base64 = "0.23"
 url = "2"
 tar = "0.4"
 zstd = "0.13"
