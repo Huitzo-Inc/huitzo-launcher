@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Huitzo Inc. All rights reserved.
+// SPDX-License-Identifier: LicenseRef-Huitzo-Source-Available
+
 //! Deployment capability document — fetch + verify.
 //!
 //! The capability document is the launcher's wire contract with a

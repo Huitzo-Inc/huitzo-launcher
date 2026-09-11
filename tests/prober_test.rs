@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Huitzo Inc. All rights reserved.
+// SPDX-License-Identifier: LicenseRef-Huitzo-Source-Available
+
 //! Integration tests for the in-launcher capability prober.
 //!
 //! Exercises the prober through the library surface (`huitzo_launcher::prober`)

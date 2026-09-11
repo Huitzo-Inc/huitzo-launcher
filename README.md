@@ -25,6 +25,14 @@ consent before installing any third-party software.
 curl -sSf https://raw.githubusercontent.com/Huitzo-Inc/huitzo-launcher/main/install.sh | sh
 ```
 
+Run in a terminal, this prompts for consent before installing. For
+non-interactive environments (CI, containers, provisioning scripts), grant
+consent up front with `HUITZO_ASSUME_YES=1`:
+
+```sh
+curl -sSf https://raw.githubusercontent.com/Huitzo-Inc/huitzo-launcher/main/install.sh | HUITZO_ASSUME_YES=1 sh
+```
+
 ### Homebrew (macOS)
 
 ```sh
@@ -97,4 +105,10 @@ cargo build --release
 
 ## License
 
-Proprietary - Huitzo Inc.
+Source-available under the **Huitzo Source-Available License** — see
+[LICENSE](LICENSE). The source is public for transparency and installation;
+copying, modification, and redistribution require written permission from
+Huitzo Inc.
+
+"Huitzo" and the Huitzo logo are trademarks of Huitzo Inc. — see
+[TRADEMARKS.md](TRADEMARKS.md).

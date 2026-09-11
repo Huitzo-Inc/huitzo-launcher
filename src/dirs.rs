@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Huitzo Inc. All rights reserved.
+// SPDX-License-Identifier: LicenseRef-Huitzo-Source-Available
+
 use std::path::PathBuf;
 
 /// Returns the Huitzo home directory: `$HUITZO_HOME` or `~/.huitzo/`.

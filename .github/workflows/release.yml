@@ -148,8 +148,11 @@ jobs:
     steps:
       - name: Collect SHA256 checksums from release assets
         id: shas
+        # TAG flows in via env, not inline ${{ }} interpolation: tag names may
+        # contain shell metacharacters, and this job holds TAP_UPDATE_TOKEN.
+        env:
+          TAG: ${{ github.ref_name }}
         run: |
-          TAG="${{ github.ref_name }}"
           BASE="https://github.com/Huitzo-Inc/huitzo-launcher/releases/download/${TAG}"
 
           fetch_sha() {
@@ -170,18 +173,25 @@ jobs:
           path: tap
 
       - name: Update formula version and checksums
+        env:
+          VERSION: ${{ steps.shas.outputs.version }}
+          ARM_MAC: ${{ steps.shas.outputs.arm_mac }}
+          INTEL_MAC: ${{ steps.shas.outputs.intel_mac }}
+          ARM_LINUX: ${{ steps.shas.outputs.arm_linux }}
+          INTEL_LINUX: ${{ steps.shas.outputs.intel_linux }}
         run: |
           python3 - <<'EOF'
+          import os
           import re
 
           with open("tap/Formula/huitzo.rb") as f:
               content = f.read()
 
-          version     = "${{ steps.shas.outputs.version }}"
-          arm_mac     = "${{ steps.shas.outputs.arm_mac }}"
-          intel_mac   = "${{ steps.shas.outputs.intel_mac }}"
-          arm_linux   = "${{ steps.shas.outputs.arm_linux }}"
-          intel_linux = "${{ steps.shas.outputs.intel_linux }}"
+          version     = os.environ["VERSION"]
+          arm_mac     = os.environ["ARM_MAC"]
+          intel_mac   = os.environ["INTEL_MAC"]
+          arm_linux   = os.environ["ARM_LINUX"]
+          intel_linux = os.environ["INTEL_LINUX"]
 
           content = re.sub(r'version "[^"]+"', f'version "{version}"', content)
 
@@ -205,21 +215,39 @@ jobs:
           EOF
 
       - name: Commit and open PR
+        # VERSION/TAG flow in via env, not inline ${{ }}: tag-derived values
+        # may contain shell metacharacters and this step holds the tap PAT.
         run: |
           cd tap
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          BRANCH="auto/bump-huitzo-${{ steps.shas.outputs.version }}"
+          BRANCH="auto/bump-huitzo-${VERSION}"
           git checkout -b "$BRANCH"
           git add Formula/huitzo.rb
-          git commit -m "chore: bump huitzo launcher to v${{ steps.shas.outputs.version }}"
+          git commit -m "chore: bump huitzo launcher to v${VERSION}"
           git push origin "$BRANCH"
 
           gh pr create \
-            --title "chore: bump huitzo launcher to v${{ steps.shas.outputs.version }}" \
-            --body "Automated formula update triggered by https://github.com/Huitzo-Inc/huitzo-launcher/releases/tag/${{ github.ref_name }}" \
+            --title "chore: bump huitzo launcher to v${VERSION}" \
+            --body "Automated formula update triggered by https://github.com/Huitzo-Inc/huitzo-launcher/releases/tag/${TAG}" \
             --base main \
             --head "$BRANCH"
+
+          # Merge immediately: the tap has no CI of its own and an unmerged
+          # bump means brew silently serves a stale launcher (this happened
+          # for v0.2.8/v0.2.9). The checksums above were fetched from the
+          # just-published release assets, so the PR content is already
+          # verified; a human review adds nothing but drift.
+          if ! gh pr merge "$BRANCH" --repo Huitzo-Inc/homebrew-tap --squash --delete-branch; then
+            # Fail LOUDLY: an unmerged bump is exactly the silent-drift bug
+            # this step exists to kill (v0.2.8/v0.2.9). The release assets are
+            # already published, so failing here rolls nothing back — it just
+            # makes the tap-sync gap unmissable.
+            echo "::error::Tap bump PR could not be auto-merged — brew will serve a stale launcher until it is merged manually"
+            exit 1
+          fi
         env:
           GH_TOKEN: ${{ secrets.TAP_UPDATE_TOKEN }}
+          VERSION: ${{ steps.shas.outputs.version }}
+          TAG: ${{ github.ref_name }}
