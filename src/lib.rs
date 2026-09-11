@@ -17,3 +17,4 @@ pub mod errors;
 pub mod keys;
 pub mod manifest;
 pub mod prober;
+pub mod update;
