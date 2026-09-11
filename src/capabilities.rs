@@ -13,6 +13,12 @@
 //! Wire contract is owned by issue #584. We mirror the response shape
 //! here; missing optional fields are tolerated so backend rollouts can
 //! evolve without breaking already-deployed launchers.
+//!
+//! The optional `next_public_key` / `next_key_not_after` /
+//! `next_key_attestation` trio drives overlap-window key rotation (#26).
+//! They are *not* covered by `doc_signature` — `keys::apply_rotation`
+//! checks them against the already-pinned key instead. See the `keys`
+//! module doc comment for the full contract.
 
 use std::io::Read;
 use std::time::Duration;
@@ -49,6 +55,18 @@ pub struct CapabilityDoc {
     /// rotation. Free-form, populated by the deployment admin.
     #[serde(default)]
     pub trust_advisory_url: Option<String>,
+    /// Overlap-window rotation: base64 raw 32-byte Ed25519 public key the
+    /// deployment is rotating to. Supplied together with the two fields
+    /// below, or not at all.
+    #[serde(default)]
+    pub next_public_key: Option<String>,
+    /// Overlap-window rotation: `YYYY-MM-DDTHH:MM:SSZ` end of the window.
+    #[serde(default)]
+    pub next_key_not_after: Option<String>,
+    /// Overlap-window rotation: base64 raw 64-byte Ed25519 signature by the
+    /// *current* root key over `keys::canonical_rotation_message`.
+    #[serde(default)]
+    pub next_key_attestation: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -147,12 +165,74 @@ pub fn verify(doc: &CapabilityDoc, key: &VerifyingKey) -> Result<(), Error> {
     })
 }
 
+/// Decode the overlap-window rotation fields, if the document carries them.
+///
+/// Returns `Ok(None)` when the trio is absent (the common case, and every
+/// document from a backend that predates #26). Returns `Err(reason)` when
+/// the fields are present but unusable; the caller warns and carries on
+/// without an offer, which is the fail-closed direction.
+///
+/// Nothing decoded here is trusted — `keys::apply_rotation` checks the
+/// attestation against the already-pinned key.
+pub fn parse_rotation_offer(doc: &CapabilityDoc) -> Result<Option<keys::RotationOffer>, String> {
+    // Treat empty / whitespace-only strings as absent so a backend that
+    // emits "" for "no rotation" doesn't trip the all-or-nothing check.
+    let present = |field: &Option<String>| -> Option<String> {
+        field
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let next_public_key = present(&doc.next_public_key);
+    let not_after = present(&doc.next_key_not_after);
+    let attestation = present(&doc.next_key_attestation);
+
+    let (next_public_key, not_after, attestation) = match (next_public_key, not_after, attestation)
+    {
+        (None, None, None) => return Ok(None),
+        (Some(k), Some(d), Some(a)) => (k, d, a),
+        _ => {
+            return Err(
+                "next_public_key, next_key_not_after and next_key_attestation must be \
+                     supplied together"
+                    .to_string(),
+            );
+        }
+    };
+
+    let next_key = keys::decode_pubkey(&next_public_key)
+        .map_err(|e| format!("next_public_key is unusable: {e}"))?;
+
+    let sig_bytes = BASE64
+        .decode(&attestation)
+        .map_err(|e| format!("next_key_attestation is not valid base64: {e}"))?;
+    let sig_bytes: [u8; 64] = sig_bytes
+        .try_into()
+        .map_err(|v: Vec<u8>| format!("next_key_attestation must be 64 bytes, got {}", v.len()))?;
+
+    Ok(Some(keys::RotationOffer {
+        next_key,
+        not_after,
+        attestation: Signature::from_bytes(&sig_bytes),
+    }))
+}
+
 /// Fetch + TOFU-pin + verify in one step.
 ///
 /// `host` is the canonical deployment host (see `keys::canonical_host`).
 /// `force_rotate` is passed through to `keys::pin_or_load` and should
 /// only be true when the operator has confirmed an emergency rotation
 /// via `--launcher-trust-rotate`.
+///
+/// The three phases are ordered deliberately:
+///
+/// 1. Pick a verification key from trust state already on disk. Nothing in
+///    the document influences this beyond naming which already-accepted
+///    key it claims to be signed by.
+/// 2. Verify the document under that key.
+/// 3. Only then let the (now authenticated) document move trust state —
+///    promote an attested next key, or open an overlap window.
 pub fn fetch_and_verify(
     api_url: &str,
     host: &str,
@@ -162,6 +242,20 @@ pub fn fetch_and_verify(
     let advertised = keys::decode_pubkey(&doc.public_key)?;
     let pinned = keys::pin_or_load(host, &advertised, force_rotate)?;
     verify(&doc, &pinned.key)?;
+
+    let offer = match parse_rotation_offer(&doc) {
+        Ok(offer) => offer,
+        Err(reason) => {
+            eprintln!("Warning: ignoring advertised key rotation for {host}: {reason}");
+            None
+        }
+    };
+    let pinned = keys::apply_rotation(
+        host,
+        pinned,
+        offer.as_ref(),
+        doc.trust_advisory_url.as_deref(),
+    )?;
     Ok((doc, pinned))
 }
 
@@ -191,6 +285,9 @@ mod tests {
             public_key: String::new(),
             doc_signature: String::new(),
             trust_advisory_url: None,
+            next_public_key: None,
+            next_key_not_after: None,
+            next_key_attestation: None,
         }
     }
 

@@ -86,7 +86,69 @@ pub fn sample_capability(deployment: &str, bundle_url: &str, bundle_bytes: &[u8]
         public_key: String::new(),
         doc_signature: String::new(),
         trust_advisory_url: None,
+        next_public_key: None,
+        next_key_not_after: None,
+        next_key_attestation: None,
     }
+}
+
+/// Attach an overlap-window rotation offer to `doc`, attested by `attestor`.
+///
+/// `attestor` is the key that *signs* the attestation — pass the legitimate
+/// current root to build a valid offer, or any other key to build a forged
+/// one.
+#[allow(dead_code)]
+pub fn attest_rotation(
+    doc: &mut CapabilityDoc,
+    host: &str,
+    current: &SigningKey,
+    attestor: &SigningKey,
+    next: &SigningKey,
+    not_after: &str,
+) {
+    let message = huitzo_launcher::keys::canonical_rotation_message(
+        host,
+        &huitzo_launcher::keys::encode_key(&current.verifying_key()),
+        &huitzo_launcher::keys::encode_key(&next.verifying_key()),
+        not_after,
+    )
+    .unwrap();
+    doc.next_public_key = Some(BASE64.encode(next.verifying_key().as_bytes()));
+    doc.next_key_not_after = Some(not_after.to_string());
+    doc.next_key_attestation = Some(BASE64.encode(attestor.sign(&message).to_bytes()));
+}
+
+/// An ISO-8601 UTC timestamp `days` days from now, in the exact
+/// `YYYY-MM-DDTHH:MM:SSZ` shape the launcher accepts.
+#[allow(dead_code)]
+pub fn iso_days_from_now(days: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    format_unix_iso8601((now + days * 86_400).max(0) as u64)
+}
+
+/// Mirror of `keys::format_unix_iso8601`, which is private to the crate.
+fn format_unix_iso8601(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let time_of_day = secs % 86_400;
+    let (hour, minute, second) = (
+        time_of_day / 3_600,
+        (time_of_day % 3_600) / 60,
+        time_of_day % 60,
+    );
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = (z - era * 146_097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
 /// Build a minimal in-memory `.tar.zst` bundle containing the supplied
