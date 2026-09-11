@@ -12,7 +12,13 @@ use crate::errors::Error;
 ///
 /// Sets `HUITZO_MANAGED=1` so the Python CLI can detect it is running under
 /// the launcher (e.g., to suppress "run pip install --upgrade" messages).
-pub fn exec_into_python(venv_python: &Path, args: &[String]) -> Result<(), Error> {
+///
+/// `safe_path` adds `-P` (Python 3.11+), keeping the invocation directory off
+/// `sys.path`. Always true for the managed venv (guaranteed 3.11+ by
+/// `python::discover_all`); for a locally detected interpreter (#53) the
+/// caller reports what that venv's `pyvenv.cfg` says, because `-P` on an
+/// older interpreter is a hard startup error.
+pub fn exec_into_python(venv_python: &Path, args: &[String], safe_path: bool) -> Result<(), Error> {
     // Signal to the Python CLI that it's running under the launcher, and make the
     // bundled `uv` reachable (huitzo#965 / task #38): export HUITZO_HOME so the CLI can
     // resolve `<huitzo_home>/bin/uv` ABSOLUTELY (it survives the runner's env-scrub,
@@ -31,13 +37,30 @@ pub fn exec_into_python(venv_python: &Path, args: &[String]) -> Result<(), Error
 
     #[cfg(unix)]
     {
-        exec_unix(venv_python, args)
+        exec_unix(venv_python, &python_argv(args, safe_path))
     }
 
     #[cfg(windows)]
     {
-        exec_windows(venv_python, args)
+        exec_windows(venv_python, &python_argv(args, safe_path))
     }
+}
+
+/// The interpreter arguments: `[-P] -m huitzo_cli <args…>`.
+///
+/// `-P` keeps the invocation directory off `sys.path` (#53): without it a
+/// `huitzo_cli/` directory in the cwd shadows the interpreter's own installed
+/// copy, mixing a source tree with a different environment's dependencies.
+/// Mirrors the systemd unit fix in `Huitzo-Inc/cli#300`.
+fn python_argv(args: &[String], safe_path: bool) -> Vec<String> {
+    let mut argv: Vec<String> = Vec::with_capacity(args.len() + 3);
+    if safe_path {
+        argv.push("-P".to_string());
+    }
+    argv.push("-m".to_string());
+    argv.push("huitzo_cli".to_string());
+    argv.extend(args.iter().cloned());
+    argv
 }
 
 /// The current `PATH` with `<huitzo_home>/bin` prepended (as a single front entry).
@@ -68,10 +91,8 @@ fn exec_unix(venv_python: &Path, args: &[String]) -> Result<(), Error> {
     let python =
         CString::new(python_str).map_err(|e| Error::Exec(format!("Invalid python path: {e}")))?;
 
-    let mut argv: Vec<CString> = Vec::with_capacity(args.len() + 3);
+    let mut argv: Vec<CString> = Vec::with_capacity(args.len() + 1);
     argv.push(python.clone());
-    argv.push(CString::new("-m").unwrap());
-    argv.push(CString::new("huitzo_cli").unwrap());
     for arg in args {
         argv.push(
             CString::new(arg.as_str())
@@ -89,7 +110,6 @@ fn exec_windows(venv_python: &Path, args: &[String]) -> Result<(), Error> {
     use std::process::Command;
 
     let mut cmd = Command::new(venv_python);
-    cmd.args(["-m", "huitzo_cli"]);
     cmd.args(args);
 
     let status = cmd
@@ -97,4 +117,34 @@ fn exec_windows(venv_python: &Path, args: &[String]) -> Result<(), Error> {
         .map_err(|e| Error::Exec(format!("Failed to spawn Python: {e}")))?;
 
     std::process::exit(status.code().unwrap_or(1));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn argv_carries_dash_p_only_when_supported() {
+        let args = vec!["pack".to_string(), "dev".to_string()];
+        assert_eq!(
+            python_argv(&args, true),
+            vec!["-P", "-m", "huitzo_cli", "pack", "dev"]
+        );
+        // Python 3.10 rejects `-P` outright, so an interpreter we cannot
+        // prove is 3.11+ is invoked without it.
+        assert_eq!(
+            python_argv(&args, false),
+            vec!["-m", "huitzo_cli", "pack", "dev"]
+        );
+    }
+
+    #[test]
+    fn argv_preserves_user_arguments_verbatim() {
+        let args = vec!["--flag=with space".to_string(), "-P".to_string()];
+        let argv = python_argv(&args, true);
+        // The module arguments come first; a user argument that happens to
+        // look like an interpreter flag stays after `-m huitzo_cli`.
+        assert_eq!(&argv[..3], &["-P", "-m", "huitzo_cli"]);
+        assert_eq!(&argv[3..], &["--flag=with space", "-P"]);
+    }
 }

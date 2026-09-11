@@ -10,6 +10,7 @@ mod errors;
 mod exec;
 mod install;
 mod keys;
+mod local_cli;
 mod manifest;
 mod prober;
 mod python;
@@ -19,10 +20,20 @@ mod uv_manifest;
 mod venv;
 
 use errors::Error;
+use local_cli::{Decision, LocalSource};
 use manifest::Manifest;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // Opt out of local-CLI detection (#53): delegate to the managed venv
+    // unconditionally. Consumed here — like `--launcher-trust-rotate` — so it
+    // never reaches the Python CLI on exec.
+    let use_installed = args.iter().any(|a| a == local_cli::USE_INSTALLED_FLAG);
+    let args: Vec<String> = args
+        .into_iter()
+        .filter(|a| a != local_cli::USE_INSTALLED_FLAG)
+        .collect();
 
     // Intercept launcher-specific flags
     if args.iter().any(|a| a == "--launcher-version") {
@@ -79,8 +90,9 @@ fn main() {
     }
 
     // Emergency TOFU rotation: operator opts in to overwrite a pinned key
-    // after a deployment-root rotation outside the (deferred) overlap-
-    // window mechanism. The flag is consumed here so it never reaches the
+    // after a deployment-root rotation that did not go through the routine
+    // overlap-window mechanism in `keys` (#26) — or went through it and
+    // expired unused. The flag is consumed here so it never reaches the
     // Python CLI on exec.
     let force_trust_rotate = args.iter().any(|a| a == "--launcher-trust-rotate");
     let args: Vec<String> = args
@@ -88,11 +100,16 @@ fn main() {
         .filter(|a| a != "--launcher-trust-rotate")
         .collect();
 
-    run_with(args, force_trust_rotate);
+    run_with(args, force_trust_rotate, use_installed);
 }
 
+/// Continue into the CLI after an explicit `--launcher-bootstrap`.
+///
+/// `use_installed` is forced on: asking for a bootstrap IS asking for the
+/// managed environment, so the run that follows must not be redirected to a
+/// local checkout (#53).
 fn run(args: Vec<String>) {
-    run_with(args, false);
+    run_with(args, false, true);
 }
 
 /// Refresh the active deployment's capability document and re-stage the
@@ -167,7 +184,48 @@ fn refresh_capabilities_if_needed(force_trust_rotate: bool) -> bool {
     }
 }
 
-fn run_with(args: Vec<String>, force_trust_rotate: bool) {
+fn run_with(args: Vec<String>, force_trust_rotate: bool, use_installed: bool) {
+    // 0. Local-CLI detection (#53). This runs BEFORE the managed-venv
+    //    bootstrap and update check: those exist only to maintain
+    //    `~/.huitzo/venv`, and bootstrapping (or updating, or prompting for
+    //    install consent on) an environment we are about to ignore is pure
+    //    cost. Deployment-level state — the SDK bundle and the staged `uv` —
+    //    IS still refreshed on the local path; see `run_local`.
+    match local_cli::Detect::from_process(use_installed).decide() {
+        Decision::Delegate => {}
+        Decision::DelegateUntrustedCheckout { checkout, reason } => {
+            // Something that looks like a huitzo-cli checkout, in a directory
+            // this user does not own — ambient discovery we refuse to act on
+            // (a `pyproject.toml` planted in a world-writable directory must
+            // never choose the interpreter). Delegate, but say it happened,
+            // because the legitimate version of this — a checkout owned by
+            // another account — would otherwise be another silent divergence.
+            eprintln!(
+                "huitzo: ignoring the huitzo-cli checkout at {} ({}); using {}",
+                checkout.display(),
+                reason,
+                dirs::venv_python().display()
+            );
+        }
+        Decision::RunLocal {
+            python,
+            source,
+            safe_path,
+        } => {
+            run_local(&python, source, safe_path, &args, force_trust_rotate);
+            return;
+        }
+        Decision::Refuse { checkout, searched } => {
+            let e = Error::LocalCliUnavailable {
+                checkout: checkout.display().to_string(),
+                managed: dirs::venv_python().display().to_string(),
+                searched: searched.iter().map(|p| p.display().to_string()).collect(),
+            };
+            eprintln!("Error: {e}");
+            std::process::exit(errors::exit_code(&e));
+        }
+    }
+
     // 1. Read manifest
     let manifest = manifest::load();
 
@@ -253,11 +311,81 @@ fn run_with(args: Vec<String>, force_trust_rotate: bool) {
         eprintln!("Warning: uv setup failed (non-fatal): {e}");
     }
 
-    // 8. Exec into Python CLI (never returns on Unix)
-    if let Err(e) = exec::exec_into_python(&dirs::venv_python(), &args) {
+    // 8. Exec into Python CLI (never returns on Unix). The managed venv is
+    //    guaranteed Python 3.11+ by `python::discover_all`, so `-P` is always
+    //    safe here.
+    if let Err(e) = exec::exec_into_python(&dirs::venv_python(), &args, true) {
         eprintln!("Error: {e}");
         std::process::exit(errors::exit_code(&e));
     }
+}
+
+/// Exec into a locally detected `huitzo_cli` instead of the managed venv (#53).
+///
+/// Ordering rationale — what runs here and what deliberately does not:
+///   * managed-venv bootstrap / update check / pending-update apply: SKIPPED.
+///     They maintain `~/.huitzo/venv`, which this path does not use; running
+///     them would install, prompt, and hit the network for an environment we
+///     are about to ignore. `huitzo --launcher-update` and
+///     `huitzo --use-installed` still drive them explicitly.
+///   * capability refresh + SDK bundle staging: KEPT. It is deployment-level,
+///     not venv-level: the marker is written by whichever CLI ran `login` /
+///     `config set api_url` — including this one — and the local CLI resolves
+///     the staged SDK bundle out of `$HUITZO_HOME`. Skipping it would leave a
+///     stale bundle behind a fresh CLI, which is the same class of drift #53
+///     is about. It costs one `stat` when no marker is present.
+///   * `uv` staging: KEPT, but only when `$HUITZO_HOME` already exists. The
+///     local CLI resolves `<huitzo_home>/bin/uv` absolutely for pack builds,
+///     so a managed install must keep it current; a developer who has never
+///     run the managed launcher gets no surprise 15 MB download on their
+///     first `huitzo` from a checkout (their own `uv` is on PATH).
+fn run_local(
+    python: &std::path::Path,
+    source: LocalSource,
+    safe_path: bool,
+    args: &[String],
+    rotate: bool,
+) {
+    // Exactly one line, on stderr, naming the interpreter that will run. The
+    // bug in #53 was that divergence was invisible; this path must be visible
+    // whenever it diverges — and silent when it does not.
+    eprintln!(
+        "huitzo: using the local CLI at {} (detected via {}) — pass --use-installed for {}",
+        python.display(),
+        source.label(),
+        dirs::venv_python().display()
+    );
+
+    // The launcher's own pending self-update is applied in step 6, which this
+    // path skips. Applying it here would mean a network round-trip on a
+    // developer's every command; saying nothing would mean a launcher update
+    // that never lands and never mentions itself — the same invisibility #53
+    // is about. So: name it, once, and let the developer choose.
+    if let Some(version) = pending_launcher_update() {
+        eprintln!(
+            "huitzo: launcher update {version} is pending — apply it with `huitzo --launcher-update`"
+        );
+    }
+
+    let _ = refresh_capabilities_if_needed(rotate);
+
+    if dirs::huitzo_home().exists() {
+        if let Err(e) = uv::ensure_uv() {
+            eprintln!("Warning: uv setup failed (non-fatal): {e}");
+        }
+    }
+
+    if let Err(e) = exec::exec_into_python(python, args, safe_path) {
+        eprintln!("Error: {e}");
+        std::process::exit(errors::exit_code(&e));
+    }
+}
+
+/// The version of a pending launcher self-update, if one is recorded.
+fn pending_launcher_update() -> Option<String> {
+    let m = manifest::load()?;
+    let pending = m.pending_update?;
+    (pending.kind == "launcher").then_some(pending.version)
 }
 
 /// Bootstrap: discover Python, create venv, install huitzo, write manifest.

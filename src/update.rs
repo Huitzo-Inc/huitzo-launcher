@@ -118,18 +118,12 @@ fn fetch_all_releases() -> Result<serde_json::Value, Error> {
 /// Launcher releases are tagged `v*` (e.g. `v0.2.3`).
 /// CLI releases are tagged `cli-v*` and are excluded.
 ///
-/// GitHub's Releases API returns releases in reverse chronological order,
-/// so the first matching `v*` tag is the most recent launcher release.
+/// The position of a release in the array says nothing about its version
+/// (see [`select_newest_release`]), so the newest is chosen by comparing
+/// parsed version numbers.
 fn find_latest_launcher_version(releases: &serde_json::Value) -> Option<String> {
-    let tag = releases
-        .as_array()?
-        .iter()
-        .filter_map(|r| r["tag_name"].as_str())
-        .find(|t| t.starts_with('v') && !t.starts_with("cli-v"))?;
-
-    // strip_prefix is guaranteed to succeed here (filter ensures 'v' prefix),
-    // but unwrap_or is kept as defensive fallback.
-    Some(tag.strip_prefix('v').unwrap_or(tag).to_string())
+    let tag = find_latest_launcher_release(releases)?["tag_name"].as_str()?;
+    Some(launcher_tag_version(tag).unwrap_or(tag).to_string())
 }
 
 /// Returns the platform-specific asset name for the current target triple.
@@ -244,11 +238,21 @@ pub fn self_update() -> Result<(), Error> {
 /// Launcher releases are tagged `v*` (e.g. `v0.2.5`); CLI releases are tagged
 /// `cli-v*` and are excluded. Returns a reference into `releases`.
 fn find_latest_launcher_release(releases: &serde_json::Value) -> Option<&serde_json::Value> {
-    releases.as_array()?.iter().find(|r| {
-        r["tag_name"]
-            .as_str()
-            .is_some_and(|t| t.starts_with('v') && !t.starts_with("cli-v"))
-    })
+    select_newest_release(releases, launcher_tag_version)
+}
+
+/// Map a launcher tag (`v0.2.5`) to the version it carries (`0.2.5`).
+///
+/// Returns `None` for anything that is not a launcher release, including CLI
+/// releases (`cli-v*`).
+///
+/// Which tags count as launcher releases must stay in lockstep with the
+/// `livecheck` regex in the Homebrew tap — both filter on `v*`. See CLAUDE.md.
+fn launcher_tag_version(tag: &str) -> Option<&str> {
+    if tag.starts_with("cli-v") {
+        return None;
+    }
+    tag.strip_prefix('v')
 }
 
 /// Find the download URL for a named asset in the release assets array.
@@ -333,14 +337,93 @@ fn download_and_hash(url: &str, dest: &std::path::Path) -> Result<String, Error>
     Ok(hash.iter().map(|b| format!("{b:02x}")).collect())
 }
 
+/// Parse a dotted version string into its numeric segments.
+///
+/// `"0.10.1"` becomes `[0, 10, 1]`, which orders correctly against
+/// `[0, 9, 0]` — a string compare would not. Segments that are not plain
+/// numbers are dropped, so `"0.10.1-rc1"` parses to `[0, 10]` and `"foo"`
+/// to an empty vector. This is the crate's single version-comparison rule:
+/// every caller that orders versions goes through it.
+///
+/// Release *selection* is stricter — see [`parse_release_version`] — because
+/// a partially-parsed version is fine for an "is this newer?" question but
+/// not for deciding which release to install.
+pub(crate) fn parse_version(version: &str) -> Vec<u32> {
+    version.split('.').filter_map(|s| s.parse().ok()).collect()
+}
+
+/// Parse a release tag's version, requiring **every** segment to be numeric.
+///
+/// Returns `None` unless every segment is one canonical decimal number, so
+/// `"0.10.1-rc1"`, `"foo"`, `"+1.2.3"`, `"01.2.3"` and `""` are all rejected.
+/// [`parse_version`] would silently drop the unparseable segments and rank
+/// `"0.10.1-rc1"` as `[0, 10]` — below plain `0.10.1`, and tied with an
+/// unrelated `0.10`. A release we cannot order in full is one we must not
+/// offer as "latest", so selection skips it.
+///
+/// Requiring a *canonical* spelling matters as much as requiring a number:
+/// two tags that differ textually but parse to the same `Vec<u32>` tie, and a
+/// tie is broken by array position — the very position-dependence this
+/// selection path exists to remove (#48).
+fn parse_release_version(version: &str) -> Option<Vec<u32>> {
+    let parsed = parse_version(version);
+    // Round-trip: re-serialising the parsed numbers must reproduce the input
+    // exactly. That one check covers every way `u32::from_str` is looser than
+    // a release tag should be — non-numeric or empty segments, a leading `+`,
+    // leading zeros — and a segment that overflows `u32`, which `parse_version`
+    // drops so the rejoined string comes up short.
+    let canonical = parsed
+        .iter()
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join(".");
+    // `parse_version("")` is empty and rejoins to `""`, which would round-trip.
+    (!parsed.is_empty() && canonical == version).then_some(parsed)
+}
+
+/// Select the newest release from a GitHub releases JSON array.
+///
+/// `version_of` maps a `tag_name` to the version substring to compare, or
+/// `None` if the tag is not the kind of release the caller wants.
+///
+/// Selection is by parsed version, never by position in the array. GitHub
+/// sorts `/releases` by `created_at`, and every `cli-v*` release shares one
+/// `created_at` (they are all tagged off the same commit), so the order among
+/// them is arbitrary — trusting it pinned users on `cli-v0.9.0` while
+/// `cli-v0.10.1` existed (#48).
+///
+/// `draft` releases are excluded. Prereleases are **not**: every `cli-v*`
+/// release is published as a prerelease, so filtering them would disable CLI
+/// updates entirely.
+///
+/// A release whose version is not wholly numeric (`cli-vfoo`, `cli-v`,
+/// `cli-v0.10.1-rc1` — see [`parse_release_version`]) is skipped rather than
+/// ranked, so a tag we cannot order can neither beat a well-formed newer one
+/// nor be returned as "latest" when it is the only candidate.
+pub(crate) fn select_newest_release<F>(
+    releases: &serde_json::Value,
+    version_of: F,
+) -> Option<&serde_json::Value>
+where
+    F: Fn(&str) -> Option<&str>,
+{
+    releases
+        .as_array()?
+        .iter()
+        .filter(|r| !r["draft"].as_bool().unwrap_or(false))
+        .filter_map(|r| {
+            let tag = r["tag_name"].as_str()?;
+            Some((parse_release_version(version_of(tag)?)?, r))
+        })
+        .max_by(|a, b| a.0.cmp(&b.0))
+        .map(|(_, r)| r)
+}
+
 /// Simple version comparison: "0.2.0" > "0.1.7".
 ///
-/// Compares numeric segments left-to-right.
+/// Compares numeric segments left-to-right (see [`parse_version`]).
 fn version_is_newer(latest: &str, current: &str) -> bool {
-    let parse = |v: &str| -> Vec<u32> { v.split('.').filter_map(|s| s.parse().ok()).collect() };
-    let l = parse(latest);
-    let c = parse(current);
-    l > c
+    parse_version(latest) > parse_version(current)
 }
 
 #[cfg(test)]
@@ -449,5 +532,202 @@ mod tests {
             serde_json::from_str(r#"[{"tag_name": "cli-v0.5.0"}, {"tag_name": "cli-v0.4.0"}]"#)
                 .unwrap();
         assert!(find_latest_launcher_release(&releases).is_none());
+    }
+
+    // --- #48: selection must be by version, never by array position ---------
+
+    #[test]
+    fn parse_version_orders_numerically_not_lexically() {
+        assert_eq!(parse_version("0.10.1"), vec![0, 10, 1]);
+        assert!(parse_version("0.10.1") > parse_version("0.9.0"));
+        // Segments that are not numbers are dropped; a tag with no numbers at
+        // all parses to an empty vector, which callers treat as "unorderable".
+        assert_eq!(parse_version("foo"), Vec::<u32>::new());
+        assert_eq!(parse_version(""), Vec::<u32>::new());
+        assert_eq!(parse_version("0.foo.3"), vec![0, 3]);
+    }
+
+    #[test]
+    fn find_latest_launcher_version_picks_newest_not_first() {
+        // Mirrors the real API page from #48: newest is not at index 0, and
+        // 0.10.0 must beat 0.9.0 (a string compare would get this wrong).
+        let releases: serde_json::Value = serde_json::from_str(
+            r#"[
+                {"tag_name": "v0.9.0",  "created_at": "2026-07-20T04:26:37Z"},
+                {"tag_name": "v0.8.0",  "created_at": "2026-07-20T04:26:37Z"},
+                {"tag_name": "v0.10.0", "created_at": "2026-07-20T04:26:37Z"},
+                {"tag_name": "v0.2.5",  "created_at": "2026-07-20T04:26:37Z"}
+            ]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            find_latest_launcher_version(&releases).as_deref(),
+            Some("0.10.0")
+        );
+    }
+
+    #[test]
+    fn find_latest_launcher_release_picks_newest_not_first() {
+        let releases: serde_json::Value = serde_json::from_str(
+            r#"[
+                {"tag_name": "v0.9.0",  "assets": []},
+                {"tag_name": "v0.10.1", "assets": [{"name": "huitzo-x86_64-apple-darwin"}]}
+            ]"#,
+        )
+        .unwrap();
+        let release = find_latest_launcher_release(&releases).unwrap();
+        assert_eq!(release["tag_name"].as_str(), Some("v0.10.1"));
+        assert!(release["assets"].as_array().is_some_and(|a| !a.is_empty()));
+    }
+
+    #[test]
+    fn launcher_selection_excludes_drafts() {
+        let releases: serde_json::Value = serde_json::from_str(
+            r#"[
+                {"tag_name": "v0.11.0", "draft": true},
+                {"tag_name": "v0.10.1", "draft": false}
+            ]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            find_latest_launcher_version(&releases).as_deref(),
+            Some("0.10.1")
+        );
+    }
+
+    #[test]
+    fn launcher_selection_keeps_prereleases() {
+        // Prereleases must stay eligible — every cli-v* release is marked
+        // prerelease, so filtering them would disable updates entirely.
+        let releases: serde_json::Value = serde_json::from_str(
+            r#"[
+                {"tag_name": "v0.9.0",  "prerelease": false},
+                {"tag_name": "v0.10.1", "prerelease": true}
+            ]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            find_latest_launcher_version(&releases).as_deref(),
+            Some("0.10.1")
+        );
+    }
+
+    #[test]
+    fn launcher_selection_skips_malformed_tags() {
+        let releases: serde_json::Value = serde_json::from_str(
+            r#"[
+                {"tag_name": "vfoo"},
+                {"tag_name": "v"},
+                {"tag_name": "v0.1.0"},
+                {"tag_name": 42},
+                {"no_tag": true}
+            ]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            find_latest_launcher_version(&releases).as_deref(),
+            Some("0.1.0"),
+            "a malformed tag must never win over a well-formed one"
+        );
+    }
+
+    #[test]
+    fn launcher_selection_returns_none_when_every_tag_is_malformed() {
+        let releases: serde_json::Value =
+            serde_json::from_str(r#"[{"tag_name": "vfoo"}, {"tag_name": "v"}]"#).unwrap();
+        assert_eq!(
+            find_latest_launcher_version(&releases),
+            None,
+            "an unorderable tag is skipped, not returned as latest"
+        );
+    }
+
+    #[test]
+    fn launcher_selection_tolerates_short_and_long_versions() {
+        let releases: serde_json::Value = serde_json::from_str(
+            r#"[
+                {"tag_name": "v1.2.3.4"},
+                {"tag_name": "v1.2.3"},
+                {"tag_name": "v1"}
+            ]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            find_latest_launcher_version(&releases).as_deref(),
+            Some("1.2.3.4")
+        );
+    }
+
+    #[test]
+    fn parse_release_version_requires_every_segment_to_be_numeric() {
+        assert_eq!(parse_release_version("0.10.1"), Some(vec![0, 10, 1]));
+        assert_eq!(parse_release_version("1"), Some(vec![1]));
+        // Selection is stricter than `parse_version`, which would silently
+        // truncate these and rank them as something they are not.
+        assert_eq!(parse_version("0.10.1-rc1"), vec![0, 10]);
+        assert_eq!(parse_release_version("0.10.1-rc1"), None);
+        assert_eq!(parse_release_version("foo"), None);
+        assert_eq!(parse_release_version(""), None);
+        assert_eq!(parse_release_version(".1."), None);
+        assert_eq!(parse_release_version("1..2"), None);
+        assert_eq!(parse_release_version(" 1.2"), None);
+        // `u32::from_str` accepts a leading `+`; selection must not, or
+        // `v+1.2.3` would tie with `v1.2.3` and the tie would be broken by
+        // array position.
+        assert_eq!(parse_version("+1.2.3"), vec![1, 2, 3]);
+        assert_eq!(parse_release_version("+1.2.3"), None);
+        // Leading zeros are the same hazard: `u32::from_str` accepts them, so
+        // `01.2.3` would parse to `[1, 2, 3]` and tie with `1.2.3`.
+        assert_eq!(parse_version("01.2.3"), vec![1, 2, 3]);
+        assert_eq!(parse_release_version("01.2.3"), None);
+        assert_eq!(parse_release_version("1.02.3"), None);
+        assert_eq!(parse_release_version("00"), None);
+        // A bare zero segment is canonical — `0.10.1` is a real tag.
+        assert_eq!(parse_release_version("0.10.1"), Some(vec![0, 10, 1]));
+        assert_eq!(parse_release_version("4294967295"), Some(vec![4294967295]));
+        // Out of `u32` range is "not a plain number" too, so it is skipped
+        // rather than silently dropping the segment and misranking the tag.
+        assert_eq!(parse_release_version("4294967296.0.0"), None);
+    }
+
+    #[test]
+    fn launcher_selection_never_ties_a_noncanonical_tag_with_a_plain_one() {
+        // Both spellings parse to [1, 2, 3] under `parse_version`, so without
+        // the canonical-spelling gate they would tie and array position would
+        // decide the winner.
+        for odd in ["v+1.2.3", "v01.2.3", "v1.02.3"] {
+            let releases: serde_json::Value = serde_json::from_str(&format!(
+                r#"[{{"tag_name": "{odd}"}}, {{"tag_name": "v1.2.3"}}]"#
+            ))
+            .unwrap();
+            assert_eq!(
+                find_latest_launcher_version(&releases).as_deref(),
+                Some("1.2.3"),
+                "{odd} must not be ranked as 1.2.3"
+            );
+        }
+    }
+
+    #[test]
+    fn launcher_selection_skips_versions_it_cannot_order() {
+        let releases: serde_json::Value = serde_json::from_str(
+            r#"[
+                {"tag_name": "v0.11.0-rc1"},
+                {"tag_name": "v0.10.1"}
+            ]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            find_latest_launcher_version(&releases).as_deref(),
+            Some("0.10.1"),
+            "a suffixed tag must not be ranked as the truncated version it parses to"
+        );
+    }
+
+    #[test]
+    fn select_newest_release_returns_none_for_non_array() {
+        let releases: serde_json::Value =
+            serde_json::from_str(r#"{"message": "Not Found"}"#).unwrap();
+        assert!(select_newest_release(&releases, |t| t.strip_prefix('v')).is_none());
     }
 }
