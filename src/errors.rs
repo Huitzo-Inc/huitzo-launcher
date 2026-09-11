@@ -29,6 +29,15 @@ pub enum Error {
     /// exit-coded distinctly from install/network errors so scripts can tell
     /// "user declined" from "install broke".
     ConsentDeclined,
+    /// A `huitzo-cli` source checkout was detected but no local environment
+    /// can run it (#53). Delegating to the managed venv here would silently
+    /// run a different version of the CLI than the caller believes, so the
+    /// launcher refuses and names both paths instead.
+    LocalCliUnavailable {
+        checkout: String,
+        managed: String,
+        searched: Vec<String>,
+    },
 }
 
 impl fmt::Display for Error {
@@ -79,6 +88,35 @@ impl fmt::Display for Error {
                 f,
                 "Installation declined. No third-party software was installed."
             ),
+            Error::LocalCliUnavailable {
+                checkout,
+                managed,
+                searched,
+            } => {
+                // `searched` is never empty as `Decision::Refuse` is built
+                // today (the checkout's own `.venv` is always a candidate);
+                // the branch keeps the message well-formed rather than being
+                // load-bearing.
+                let searched = if searched.is_empty() {
+                    "    (none)".to_string()
+                } else {
+                    searched
+                        .iter()
+                        .map(|p| format!("    {p}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                write!(
+                    f,
+                    "Refusing to run the managed CLI from a huitzo-cli source checkout.\n\n\
+                     \x20 Checkout detected: {checkout}\n\
+                     \x20 Would have run:    {managed}\n\
+                     \x20 No local huitzo_cli found in:\n{searched}\n\n\
+                     Install the checkout's environment (e.g. `uv sync`), or run the\n\
+                     managed CLI deliberately:\n\
+                     \x20 huitzo --use-installed <command>   (or HUITZO_LAUNCHER_FORCE=1)"
+                )
+            }
         }
     }
 }
@@ -104,5 +142,7 @@ pub fn exit_code(err: &Error) -> i32 {
         // Deliberate user decline — distinct from install/network failures
         // (69) so scripts can branch on "user declined" vs "install broke".
         Error::ConsentDeclined => 70, // EX_SOFTWARE-adjacent slot, reserved here for user-decline
+        // The environment, not the launcher, is misconfigured (#53).
+        Error::LocalCliUnavailable { .. } => 78, // EX_CONFIG
     }
 }

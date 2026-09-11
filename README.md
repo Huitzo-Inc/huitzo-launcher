@@ -85,7 +85,25 @@ huitzo --launcher-bootstrap            # Force re-create the venv
 huitzo --launcher-update               # Update the launcher binary itself
 huitzo --launcher-detect               # Emit the capability report (JSON)
 huitzo --launcher-detect --human       # Capability report (readable summary)
+huitzo --use-installed <command>       # Force the managed ~/.huitzo/venv, skipping
+                                       # local-checkout detection
 ```
+
+### Running from a source checkout
+
+Invoked from a `huitzo-cli` source checkout — or with an environment active
+that already has `huitzo_cli` installed — the launcher runs **that** CLI
+instead of the managed one and says so on stderr. It never silently substitutes
+a different version. If a checkout is detected but no local `huitzo_cli` can be
+found, the launcher refuses and names both paths rather than running code you
+did not ask for. Use `--use-installed` (or `HUITZO_LAUNCHER_FORCE=1`) to
+delegate to `~/.huitzo/venv` deliberately.
+
+A checkout discovered by walking up from the current directory is only used
+when it — and the `.venv` it selects — belong to you and are not
+world-writable, so a `pyproject.toml` left in a shared directory cannot decide
+which interpreter runs. An environment you activated yourself (`VIRTUAL_ENV`,
+`UV_PROJECT_ENVIRONMENT`) is always honoured.
 
 ## Environment Variables
 
@@ -96,6 +114,7 @@ huitzo --launcher-detect --human       # Capability report (readable summary)
 | `HUITZO_SKIP_UPDATE_CHECK` | Disable background update checks |
 | `HUITZO_ASSUME_YES` | Grant install consent non-interactively (still recorded in the consent ledger) |
 | `HUITZO_BOOTSTRAP_CONSENTED` | Set by `install.sh`/`install.ps1` after up-front consent so first-run bootstrap does not re-prompt |
+| `HUITZO_LAUNCHER_FORCE` | Always delegate to `~/.huitzo/venv`, skipping local-checkout detection (same as `--use-installed`) |
 
 ## Build from Source
 
