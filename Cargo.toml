@@ -32,7 +32,7 @@ zstd = "0.13"
 flate2 = "1"
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31", features = ["process"] }
+nix = { version = "0.31", features = ["process", "user"] }
 
 # Windows uv release archive is a `.zip`; only needed there. Pure-Rust deflate.
 [target.'cfg(windows)'.dependencies]

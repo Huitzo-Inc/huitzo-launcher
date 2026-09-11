@@ -15,6 +15,7 @@ pub mod dirs;
 pub mod download;
 pub mod errors;
 pub mod keys;
+pub mod local_cli;
 pub mod manifest;
 pub mod prober;
 pub mod update;

@@ -39,6 +39,7 @@ src/
 ├── consent.rs        # Consent ledger (~/.huitzo/consent.jsonl)
 ├── capabilities.rs   # Capability detection types
 ├── prober.rs         # Capability prober (huitzo/claude/git detection)
+├── local_cli.rs      # Local huitzo_cli detection (delegate / run-local / refuse)
 ├── exec.rs           # Exec into Python CLI
 ├── dirs.rs           # Platform-specific directory resolution
 └── errors.rs         # Error types
@@ -47,6 +48,8 @@ src/
 **Key design decisions (with rationale):**
 
 - **No async runtime** — the launcher does short-lived I/O (HTTP GET, file writes, process spawn). An async runtime would add ~1 MB to the binary for no throughput benefit. `ureq` (blocking HTTP) is the right fit.
+- **Never hijack a source checkout** (#53) — before delegating to the managed venv the launcher checks whether it was invoked from a `huitzo-cli` checkout or an environment that already has `huitzo_cli`, and runs *that* interpreter instead (announcing it on stderr), or refuses when it cannot. Detection is filesystem-only — it never spawns an interpreter to probe — because it runs on every invocation (~3 µs). An **explicit** `VIRTUAL_ENV` / `UV_PROJECT_ENVIRONMENT` is trusted; a checkout found by **walking up from the cwd** is trusted only if it and its `.venv` are owned by the invoking user and not world-writable (git's `safe.directory` lesson). `--use-installed` / `HUITZO_LAUNCHER_FORCE=1` opt out.
+- **`-P` on the Python exec line** — the CLI is always started as `python -P -m huitzo_cli` so the invocation directory never lands on `sys.path`. The managed venv is guaranteed 3.11+ so `-P` always applies there; a locally detected interpreter gets it only when its `pyvenv.cfg` proves 3.11+ (the flag does not exist before then).
 - **Exec, don't subprocess** — after bootstrapping, the launcher `exec`s into the Python CLI rather than spawning it as a child process. This means zero memory overhead while the CLI runs and correct signal propagation (Ctrl-C goes to the CLI, not the launcher).
 - **Pure Rust decompression** — `flate2` with `miniz_oxide` backend and `zip` with `deflate` backend avoid system library dependencies. This is necessary for cross-compilation to Linux musl and macOS.
 - **Release manifest signing** — the launcher verifies Ed25519 signatures on the release manifest before installing anything. This prevents a compromised GitHub release from delivering malicious wheels.
@@ -82,6 +85,7 @@ cargo clippy -- -D warnings
 | `HUITZO_SKIP_UPDATE_CHECK` | Disable background update checks |
 | `HUITZO_ASSUME_YES` | Grant install consent non-interactively |
 | `HUITZO_BOOTSTRAP_CONSENTED` | Set by install scripts after up-front consent |
+| `HUITZO_LAUNCHER_FORCE` | Always delegate to `~/.huitzo/venv`, skipping local-CLI detection (same as `--use-installed`) |
 
 ## What NOT to Do
 
