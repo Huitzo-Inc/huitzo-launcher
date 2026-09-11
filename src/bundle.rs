@@ -422,7 +422,7 @@ pub fn sha256_file(path: &Path) -> Result<String, Error> {
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
-    use rand::rngs::OsRng;
+    use rand_core::OsRng;
 
     #[test]
     fn publisher_signed_message_is_id_then_key() {

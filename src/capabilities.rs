@@ -263,7 +263,7 @@ pub fn fetch_and_verify(
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
-    use rand::rngs::OsRng;
+    use rand_core::OsRng;
 
     fn sign_doc(signing: &SigningKey, doc: &mut CapabilityDoc) {
         let sig = signing.sign(&canonical_signed_message(doc));

@@ -974,7 +974,7 @@ fn format_unix_iso8601(secs: u64) -> String {
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
-    use rand::rngs::OsRng;
+    use rand_core::OsRng;
     use std::sync::Mutex;
     use tempfile::TempDir;
 
