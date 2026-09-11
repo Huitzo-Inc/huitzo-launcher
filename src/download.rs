@@ -3,6 +3,7 @@
 
 use crate::dirs;
 use crate::errors::Error;
+use crate::update::select_newest_release;
 use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::PathBuf;
@@ -70,16 +71,14 @@ pub fn fetch_cli_release() -> Result<CliRelease, Error> {
     let releases: serde_json::Value = serde_json::from_str(&body_str)
         .map_err(|e| Error::Network(format!("Failed to parse releases JSON: {e}")))?;
 
-    // Find the latest CLI release (tagged cli-v*)
-    let release = releases
-        .as_array()
-        .ok_or_else(|| Error::Network("No releases found".to_string()))?
-        .iter()
-        .find(|r| {
-            r["tag_name"]
-                .as_str()
-                .is_some_and(|t| t.starts_with("cli-v"))
-        })
+    if !releases.is_array() {
+        return Err(Error::Network("No releases found".to_string()));
+    }
+
+    // Find the latest CLI release (tagged cli-v*) by version, not by position:
+    // every cli-v* release shares one `created_at`, so the API's order among
+    // them is arbitrary (#48).
+    let release = find_latest_cli_release(&releases)
         .ok_or_else(|| Error::Network("No CLI release found (expected cli-v* tag)".to_string()))?;
 
     // Find cli-release.json asset
@@ -297,6 +296,22 @@ pub fn download_wheel(release_version: &str, wheel: &WheelInfo) -> Result<PathBu
     Ok(dest)
 }
 
+/// Map a CLI tag (`cli-v0.10.1`) to the version it carries (`0.10.1`).
+///
+/// Returns `None` for launcher tags (`v*`) and anything else.
+fn cli_tag_version(tag: &str) -> Option<&str> {
+    tag.strip_prefix("cli-v")
+}
+
+/// Find the newest CLI release (`cli-v*` tag) in a releases JSON array.
+///
+/// Ordering, draft exclusion and prerelease handling all live in
+/// [`select_newest_release`] so the launcher and the CLI agree on what
+/// "newest" means.
+fn find_latest_cli_release(releases: &serde_json::Value) -> Option<&serde_json::Value> {
+    select_newest_release(releases, cli_tag_version)
+}
+
 /// Get the latest CLI version from GitHub Releases without downloading the wheel.
 ///
 /// Used by the background update checker.
@@ -406,5 +421,118 @@ mod tests {
         {
             assert!(find_platform_wheel(&release, Some((3, 13))).is_err());
         }
+    }
+
+    // --- #48: the newest cli-v* release, not the first one -----------------
+
+    /// The real `/releases` page from #48: `cli-v0.9.0` sits at index 0,
+    /// `cli-v0.10.1` at index 4, every entry shares one `created_at`, and all
+    /// of them are prereleases.
+    fn issue_48_releases() -> serde_json::Value {
+        serde_json::from_str(
+            r#"[
+                {"tag_name": "cli-v0.9.0",  "created_at": "2026-07-20T04:26:37Z", "draft": false, "prerelease": true},
+                {"tag_name": "cli-v0.8.0",  "created_at": "2026-07-20T04:26:37Z", "draft": false, "prerelease": true},
+                {"tag_name": "v0.3.2",      "created_at": "2026-07-25T04:26:37Z", "draft": false, "prerelease": false},
+                {"tag_name": "cli-v0.7.0",  "created_at": "2026-07-20T04:26:37Z", "draft": false, "prerelease": true},
+                {"tag_name": "cli-v0.10.1", "created_at": "2026-07-20T04:26:37Z", "draft": false, "prerelease": true},
+                {"tag_name": "cli-v0.10.0", "created_at": "2026-07-20T04:26:37Z", "draft": false, "prerelease": true}
+            ]"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn find_latest_cli_release_picks_newest_not_first() {
+        let releases = issue_48_releases();
+        let release = find_latest_cli_release(&releases).unwrap();
+        assert_eq!(release["tag_name"].as_str(), Some("cli-v0.10.1"));
+    }
+
+    #[test]
+    fn find_latest_cli_release_keeps_prereleases() {
+        // Every cli-v* release is published as a prerelease. Filtering them
+        // would leave the launcher with no CLI release at all.
+        let releases: serde_json::Value = serde_json::from_str(
+            r#"[{"tag_name": "cli-v0.10.1", "draft": false, "prerelease": true}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            find_latest_cli_release(&releases).map(|r| r["tag_name"].as_str().unwrap()),
+            Some("cli-v0.10.1")
+        );
+    }
+
+    #[test]
+    fn find_latest_cli_release_excludes_drafts() {
+        let releases: serde_json::Value = serde_json::from_str(
+            r#"[
+                {"tag_name": "cli-v0.11.0", "draft": true,  "prerelease": true},
+                {"tag_name": "cli-v0.10.1", "draft": false, "prerelease": true}
+            ]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            find_latest_cli_release(&releases).map(|r| r["tag_name"].as_str().unwrap()),
+            Some("cli-v0.10.1")
+        );
+    }
+
+    #[test]
+    fn find_latest_cli_release_ignores_launcher_tags() {
+        let releases: serde_json::Value =
+            serde_json::from_str(r#"[{"tag_name": "v9.9.9"}, {"tag_name": "cli-v0.10.1"}]"#)
+                .unwrap();
+        assert_eq!(
+            find_latest_cli_release(&releases).map(|r| r["tag_name"].as_str().unwrap()),
+            Some("cli-v0.10.1")
+        );
+    }
+
+    #[test]
+    fn find_latest_cli_release_skips_malformed_tags() {
+        let releases: serde_json::Value = serde_json::from_str(
+            r#"[
+                {"tag_name": "cli-vfoo"},
+                {"tag_name": "cli-v"},
+                {"tag_name": "cli-v0.10.1"}
+            ]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            find_latest_cli_release(&releases).map(|r| r["tag_name"].as_str().unwrap()),
+            Some("cli-v0.10.1")
+        );
+
+        let all_bad: serde_json::Value =
+            serde_json::from_str(r#"[{"tag_name": "cli-vfoo"}, {"tag_name": "cli-v"}]"#).unwrap();
+        assert!(
+            find_latest_cli_release(&all_bad).is_none(),
+            "an unorderable tag must not be returned as latest"
+        );
+    }
+
+    #[test]
+    fn find_latest_cli_release_skips_versions_it_cannot_order() {
+        // `0.11.0-rc1` truncates to [0, 11] under the lenient comparison rule,
+        // which would beat 0.10.1. Selection skips it instead.
+        let releases: serde_json::Value = serde_json::from_str(
+            r#"[
+                {"tag_name": "cli-v0.11.0-rc1"},
+                {"tag_name": "cli-v0.10.1"}
+            ]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            find_latest_cli_release(&releases).map(|r| r["tag_name"].as_str().unwrap()),
+            Some("cli-v0.10.1")
+        );
+    }
+
+    #[test]
+    fn find_latest_cli_release_none_when_no_cli_tags() {
+        let releases: serde_json::Value =
+            serde_json::from_str(r#"[{"tag_name": "v0.3.2"}]"#).unwrap();
+        assert!(find_latest_cli_release(&releases).is_none());
     }
 }
