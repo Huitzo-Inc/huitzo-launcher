@@ -79,8 +79,9 @@ fn main() {
     }
 
     // Emergency TOFU rotation: operator opts in to overwrite a pinned key
-    // after a deployment-root rotation outside the (deferred) overlap-
-    // window mechanism. The flag is consumed here so it never reaches the
+    // after a deployment-root rotation that did not go through the routine
+    // overlap-window mechanism in `keys` (#26) — or went through it and
+    // expired unused. The flag is consumed here so it never reaches the
     // Python CLI on exec.
     let force_trust_rotate = args.iter().any(|a| a == "--launcher-trust-rotate");
     let args: Vec<String> = args
