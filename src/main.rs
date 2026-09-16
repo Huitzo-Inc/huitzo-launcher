@@ -764,20 +764,7 @@ fn install_from_fetched_release(
     release: &download::CliRelease,
     python_version: Option<(u8, u8)>,
 ) -> Result<&download::WheelInfo, Error> {
-    // === TEMPORARY DEFECT (T9 proof, reverted in the next commit): the PyPI
-    // fallback T2 deleted (#B4). ===
-    let wheel = match download::find_platform_wheel(release, python_version) {
-        Ok(w) => w,
-        Err(_) => {
-            eprintln!("  No wheel for this interpreter - falling back to PyPI...");
-            let status = std::process::Command::new(dirs::venv_python())
-                .args(["-m", "pip", "install", "--quiet", "huitzo"])
-                .status();
-            eprintln!("  PyPI fallback finished: {status:?}");
-            return Err(Error::PipInstall("pypi fallback (injected)".to_string()));
-        }
-    };
-    // === END TEMPORARY DEFECT ===
+    let wheel = download::find_platform_wheel(release, python_version)?;
     let wheel_path = download::download_wheel(&release.version, wheel)?;
     install::install_wheel(&wheel_path)?;
     Ok(wheel)
