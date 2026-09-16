@@ -550,9 +550,13 @@ pub fn exit_code(err: &Error) -> i32 {
     match err {
         Error::NoPython { .. } => 78,   // EX_CONFIG
         Error::VenvCreate { .. } => 73, // EX_CANTCREAT
-        Error::VenvRemove(_) => 73,     // EX_CANTCREAT
-        Error::UvUnavailable(_) => 69,  // EX_UNAVAILABLE — a fetch failed
-        Error::PipInstall(_) => 69,     // EX_UNAVAILABLE
+        // NOT 73: failing to *remove* the old environment is not failing to
+        // create a new one. The remedies differ (ownership/permissions on an
+        // existing tree vs. an interpreter or disk problem), so a wrapper that
+        // branches on the exit code has to be able to tell them apart.
+        Error::VenvRemove(_) => 74,    // EX_IOERR
+        Error::UvUnavailable(_) => 69, // EX_UNAVAILABLE — a fetch failed
+        Error::PipInstall(_) => 69,    // EX_UNAVAILABLE
         // An infrastructure outage, not a misconfigured host (M11).
         Error::FeedUnavailable { .. } => 69, // EX_UNAVAILABLE
         // This machine/interpreter is not one the feed builds for (B4/B5) —
@@ -686,6 +690,29 @@ mod tests {
             assert!(!msg.contains("PyPI"), "{msg}");
             assert!(!msg.contains("pip install"), "{msg}");
         }
+    }
+
+    /// Creating the managed venv and removing it are different failures with
+    /// different remedies, so they must not share one exit code (R60). They did
+    /// — both were 73 — which made "your old venv is root-owned" indexed by
+    /// wrapper scripts as "uv venv could not build an environment".
+    #[test]
+    fn venv_create_and_venv_remove_do_not_share_an_exit_code() {
+        let create = Error::VenvCreate {
+            interpreter: "/usr/bin/python3.12".to_string(),
+            detail: "no space left on device".to_string(),
+        };
+        let remove = Error::VenvRemove("/home/u/.huitzo/venv: Permission denied".to_string());
+
+        assert_eq!(exit_code(&create), 73, "EX_CANTCREAT — could not build it");
+        assert_eq!(exit_code(&remove), 74, "EX_IOERR — could not unlink it");
+        assert_ne!(exit_code(&create), exit_code(&remove));
+
+        // And each message still points at its own remedy.
+        assert!(create.to_string().contains("uv venv"), "{create}");
+        let remove_msg = remove.to_string();
+        assert!(remove_msg.contains("permissions"), "{remove_msg}");
+        assert!(remove_msg.contains("HUITZO_HOME"), "{remove_msg}");
     }
 
     #[test]
