@@ -8,7 +8,7 @@ The launcher is a lightweight Rust binary (~3-5 MB) that:
 
 1. **Discovers** Python 3.11+ on your system
 2. **Creates** a managed virtual environment at `~/.huitzo/venv/`
-3. **Installs** the `huitzo` CLI (compiled wheel from GitHub Releases, PyPI fallback)
+3. **Installs** the `huitzo` CLI (compiled wheel from GitHub Releases)
 4. **Checks** for updates in the background (non-blocking)
 5. **Probes** your local prerequisites (`huitzo` / `claude` / `git`) and emits a structured capability report
 6. **Execs** into the Python CLI -- zero runtime overhead
@@ -33,6 +33,21 @@ consent up front with `HUITZO_ASSUME_YES=1`:
 curl -sSf https://raw.githubusercontent.com/Huitzo-Inc/huitzo-launcher/main/install.sh | HUITZO_ASSUME_YES=1 sh
 ```
 
+### Windows (PowerShell)
+
+```powershell
+iwr -useb https://raw.githubusercontent.com/Huitzo-Inc/huitzo-launcher/main/install.ps1 | iex
+```
+
+The Huitzo **CLI** installs and runs natively on Windows — no WSL required.
+The Studio **runner** requires **WSL2** (its own outbound daemon and process
+model assume a POSIX shell, and its bootstrap is the `curl | sh` script): to
+pair a local runner on a Windows machine, install into WSL2 (Ubuntu) and run
+the Linux command above inside your distro. See
+[`docs/SUPPORT_MATRIX.md`](docs/SUPPORT_MATRIX.md) for the full support
+matrix and rationale (admin-locked corporate machines are marked
+unsupported).
+
 ### Homebrew (macOS)
 
 ```sh
@@ -42,12 +57,6 @@ brew install Huitzo-Inc/tap/huitzo
 ### Manual
 
 Download the latest binary for your platform from [Releases](https://github.com/Huitzo-Inc/huitzo-launcher/releases).
-
-> **Windows:** native Windows (non-WSL) is **not yet officially supported** —
-> use **WSL2** and run the Linux command inside your distro. See
-> [`docs/SUPPORT_MATRIX.md`](docs/SUPPORT_MATRIX.md) for the honest support
-> matrix and rationale (Windows-non-WSL and admin-locked corporate machines
-> are marked unsupported).
 
 ## Capability check
 
@@ -115,6 +124,7 @@ which interpreter runs. An environment you activated yourself (`VIRTUAL_ENV`,
 | `HUITZO_ASSUME_YES` | Grant install consent non-interactively (still recorded in the consent ledger) |
 | `HUITZO_BOOTSTRAP_CONSENTED` | Set by `install.sh`/`install.ps1` after up-front consent so first-run bootstrap does not re-prompt |
 | `HUITZO_LAUNCHER_FORCE` | Always delegate to `~/.huitzo/venv`, skipping local-checkout detection (same as `--use-installed`) |
+| `HUITZO_NO_MODIFY_PATH` | Skip the installer's `PATH` modification (`install.sh` / `install.ps1`) |
 
 ## Build from Source
 

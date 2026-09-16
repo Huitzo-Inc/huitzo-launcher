@@ -18,8 +18,8 @@ code cannot silently diverge.
 
 | Platform | Shells | One-command bootstrap | Notes |
 |----------|--------|-----------------------|-------|
-| **macOS** (Apple Silicon + Intel) | `zsh`, `bash`, `fish` | `curl -sSf https://huitzo.ai/install.sh \| sh` | Primary target. |
-| **Linux** (glibc + musl, x86_64 + aarch64) | `bash`, `zsh`, `fish` | `curl -sSf https://huitzo.ai/install.sh \| sh` | Primary target. |
+| **macOS** (Apple Silicon only) | `zsh`, `bash`, `fish` | `curl -sSf https://raw.githubusercontent.com/Huitzo-Inc/huitzo-launcher/main/install.sh \| sh` | Primary target. Intel macOS (`x86_64`) is **unsupported** — no `macos-x86_64` CLI wheel is published; the launcher refuses rather than falling through to an unusable install. |
+| **Linux** (glibc + musl, x86_64 + aarch64) | `bash`, `zsh`, `fish` | `curl -sSf https://raw.githubusercontent.com/Huitzo-Inc/huitzo-launcher/main/install.sh \| sh` | Primary target. |
 | **WSL2** (Windows Subsystem for Linux, Ubuntu) | `bash`, `zsh` | run the Linux command **inside** the WSL distro | Treated as Linux. The launcher detects WSL and classifies it `supported`. |
 
 A machine in the supported set with all three required tools present
@@ -38,18 +38,18 @@ iwr -useb https://raw.githubusercontent.com/Huitzo-Inc/huitzo-launcher/main/inst
 to `%USERPROFILE%\.huitzo\bin`, and adds it to your user `PATH`. CLI and pack
 development work natively.
 
-The Studio **runner**, however, requires WSL2: its outbound daemon and the
-launcher's POSIX `execvp` hand-off assume a POSIX shell + process model. To
-pair a local runner on a Windows machine, install into WSL2 (Ubuntu) and run
-the Linux bootstrap there. The prober therefore classifies native Windows off
-the runner matrix (`host.support = unsupported`) with a reason that spells this
-out.
+The Studio **runner**, however, requires WSL2: its own outbound daemon and
+process model assume a POSIX shell, and its `curl | sh` bootstrap is
+POSIX-only. To pair a local runner on a Windows machine, install into WSL2
+(Ubuntu) and run the Linux bootstrap there. The prober therefore classifies
+native Windows off the runner matrix (`host.support = unsupported`) with a
+reason that spells this out.
 
 ## Limitations
 
 | Environment | Status | Why |
 |-------------|--------|-----|
-| **Native Windows (non-WSL) — Studio runner** | **WSL2 only** (CLI runs natively) | The **CLI** installs and runs natively (see the section above). The Studio **runner** assumes a POSIX shell + process model — its outbound daemon, the launcher's `execvp` hand-off, and the `curl \| sh` bootstrap all target POSIX. To pair a local runner on Windows, install into **WSL2** (Ubuntu) and run the Linux bootstrap there. |
+| **Native Windows (non-WSL) — Studio runner** | **WSL2 only** (CLI runs natively) | The **CLI** installs and runs natively (see the section above). The Studio **runner** assumes a POSIX shell + process model — its own outbound daemon and the `curl \| sh` bootstrap both target POSIX. To pair a local runner on Windows, install into **WSL2** (Ubuntu) and run the Linux bootstrap there. |
 | **Admin-locked / corporate-managed machines** | **Unsupported** | Locked-down corporate endpoints (no admin rights, MDM-enforced execution policy, mandatory EDR/antivirus that quarantines unsigned downloads, TLS-intercepting proxies, blocked package registries) break the install and/or the outbound runner channel in ways Huitzo cannot reliably detect or remediate from the launcher. The prober cannot positively identify "corporate-locked" from inside the process, so this is flagged in docs (and in onboarding copy) rather than auto-classified. Signed-binary distribution integrity that survives EDR is tracked separately as **S57** (`feat/runner-distribution-integrity`). |
 
 ## Classification rules (what the prober reports)
@@ -72,6 +72,12 @@ on such machines are told up front.
 - A required tool gap (`huitzo` / `claude` / `git` missing) is reported with a
   copy-paste install hint, and the command exits non-zero so a script can
   branch on readiness.
+- **The exit code reflects required-tool presence only, not `host.support`.**
+  A tooled native-Windows host (all of `huitzo`/`claude`/`git` present) exits
+  `0` even though it prints `host.support: unsupported` — the runner-pairing
+  gap is visible only in the JSON/human report, never in the exit code. A
+  script that needs to gate on runner eligibility, not just tool presence,
+  must inspect `host.support` itself.
 - Distribution-integrity verification of downloaded binaries beyond the
   existing SHA-256 checksum (install scripts) and the Ed25519 signed
   capability/bundle trust root (launcher) is the scope of **S57** and is not

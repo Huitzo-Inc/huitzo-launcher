@@ -14,7 +14,7 @@ A lightweight Rust binary (~3-5 MB) that manages the Huitzo CLI's Python environ
 | Rust | edition 2024, MSRV 1.85 | Stable channel |
 | serde | 1 | JSON serialization (derive) |
 | ureq | 3 | HTTP client (minimal, no async runtime) |
-| ed25519-dalek | 2 | Release manifest signature verification |
+| ed25519-dalek | 2 | Capability-report and SDK-bundle signature verification (`capabilities.rs`, `bundle.rs`) — not the release manifest |
 | sha2 | 0.11 | SHA256 for binary integrity |
 | nix | 0.31 | Unix process management (unix only) |
 | flate2 | 1 | gzip decompression (pure Rust, no system zlib) |
@@ -52,7 +52,7 @@ src/
 - **`-P` on the Python exec line** — the CLI is always started as `python -P -m huitzo_cli` so the invocation directory never lands on `sys.path`. The managed venv is guaranteed 3.11+ so `-P` always applies there; a locally detected interpreter gets it only when its `pyvenv.cfg` proves 3.11+ (the flag does not exist before then).
 - **Exec, don't subprocess** — after bootstrapping, the launcher `exec`s into the Python CLI rather than spawning it as a child process. This means zero memory overhead while the CLI runs and correct signal propagation (Ctrl-C goes to the CLI, not the launcher).
 - **Pure Rust decompression** — `flate2` with `miniz_oxide` backend and `zip` with `deflate` backend avoid system library dependencies. This is necessary for cross-compilation to Linux musl and macOS.
-- **Release manifest signing** — the launcher verifies Ed25519 signatures on the release manifest before installing anything. This prevents a compromised GitHub release from delivering malicious wheels.
+- **Release manifest integrity is SHA-256 only, unsigned** — `download.rs` fetches `cli-release.json` and verifies each wheel against a SHA-256 published *inside that same feed*. There is no signature on the manifest itself, so a compromised feed (or an unpinned `HUITZO_RELEASE_URL`/`HUITZO_RELEASE_DOWNLOAD_URL`) controls both the hash and the wheel it hashes. Ed25519 signing of the release manifest is tracked separately as **S57** and is not implemented — do not claim it is.
 - **Consent ledger is append-only and local** — `~/.huitzo/consent.jsonl` records every install consent decision (grant and decline) but is never transmitted. This is a legal requirement, not a feature preference.
 
 ## Build & Test
@@ -86,6 +86,7 @@ cargo clippy -- -D warnings
 | `HUITZO_ASSUME_YES` | Grant install consent non-interactively |
 | `HUITZO_BOOTSTRAP_CONSENTED` | Set by install scripts after up-front consent |
 | `HUITZO_LAUNCHER_FORCE` | Always delegate to `~/.huitzo/venv`, skipping local-CLI detection (same as `--use-installed`) |
+| `HUITZO_NO_MODIFY_PATH` | Skip the installer's `PATH` modification (`install.sh` / `install.ps1`) |
 
 ## What NOT to Do
 

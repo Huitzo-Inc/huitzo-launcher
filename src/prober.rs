@@ -132,7 +132,9 @@ pub fn probe() -> CapabilityReport {
             &["huitzo"],
             &["--version"],
             true,
-            Some("curl -sSf https://huitzo.ai/install.sh | sh"),
+            Some(
+                "curl -sSf https://raw.githubusercontent.com/Huitzo-Inc/huitzo-launcher/main/install.sh | sh",
+            ),
         ),
         probe_tool(
             "claude",
@@ -341,13 +343,30 @@ fn is_wsl() -> bool {
         .unwrap_or(false)
 }
 
-/// Per-OS git install hint for the probe's `install_hint`.
+/// Per-OS (and, on Linux, per-distro) git install hint for the probe's
+/// `install_hint`.
 fn git_install_hint(os: &str) -> Option<&'static str> {
     match os {
         "macos" => Some("xcode-select --install   # or: brew install git"),
-        "linux" => Some("sudo apt install git   # or your distro's package manager"),
+        "linux" => Some(linux_git_install_hint()),
         _ => Some("https://git-scm.com/downloads"),
     }
+}
+
+/// Pick a package-manager-specific git install command for the running
+/// Linux distro. Falls back to `apt` when no other package manager is
+/// detected, since Debian/Ubuntu derivatives are the common case.
+fn linux_git_install_hint() -> &'static str {
+    if std::path::Path::new("/etc/alpine-release").exists() {
+        return "apk add git";
+    }
+    if which::which("dnf").is_ok() {
+        return "sudo dnf install git";
+    }
+    if which::which("pacman").is_ok() {
+        return "sudo pacman -S git";
+    }
+    "sudo apt install git   # or your distro's package manager"
 }
 
 /// Locate this tool by id in the report, if probed.
@@ -415,6 +434,13 @@ mod tests {
         let (level, reason) = classify_support("freebsd", false);
         assert_eq!(level, SupportLevel::Unsupported);
         assert!(reason.unwrap().contains("freebsd"));
+    }
+
+    #[test]
+    fn git_install_hint_is_apt_based_on_a_debian_derivative_ci_runner() {
+        // This test runs on the CI/dev image (Debian/Ubuntu derivative, no
+        // dnf/pacman/alpine-release), so the fallback branch is exercised.
+        assert!(linux_git_install_hint().contains("apt"));
     }
 
     #[test]
