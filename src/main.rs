@@ -273,26 +273,32 @@ fn run_with(args: Vec<String>, force_trust_rotate: bool, use_installed: bool) {
                 }
                 kind => {
                     eprintln!("Updating huitzo to {}...", pending.version);
-                    let update_ok = match kind {
-                        "wheel" => {
-                            // Download compiled wheel from GitHub Releases.
-                            // Pass the Python version so ABI-keyed manifests resolve correctly.
-                            let pv = parse_python_version(&m.python_version);
-                            apply_wheel_update(pv).is_ok()
+                    // Every CLI update is a wheel from the release feed. The
+                    // old `"pip"` kind installed from PyPI, which is where the
+                    // 0.2.0 placeholder lived (#B4); a manifest still carrying
+                    // that kind gets the wheel path, not a resurrected fallback
+                    // (D5). `apply_wheel_update` verifies the result before it
+                    // can be reported as applied.
+                    // Pass the Python version so ABI-keyed manifests resolve correctly.
+                    let pv = parse_python_version(&m.python_version);
+                    let installed = match kind {
+                        "wheel" | "pip" => apply_wheel_update(pv)
+                            .inspect_err(|e| {
+                                eprintln!("Warning: update to {} failed: {e}", pending.version)
+                            })
+                            .ok(),
+                        other => {
+                            eprintln!("Warning: ignoring unknown pending update kind '{other}'");
+                            None
                         }
-                        "pip" => {
-                            // Legacy: install from PyPI (for manifests created before binary distribution)
-                            let index_url = std::env::var("HUITZO_INDEX_URL").ok();
-                            install::install_package("huitzo", index_url.as_deref()).is_ok()
-                        }
-                        _ => false,
                     };
-                    if update_ok {
+                    // The version comes from the post-install probe that just
+                    // vouched for this environment, so the manifest records
+                    // what actually runs rather than what pip was asked for.
+                    if let Some(version) = installed {
                         let mut updated = manifest::load().unwrap_or_else(|| m.clone_for_update());
                         updated.pending_update = None;
-                        if let Ok(Some(v)) = install::get_installed_version("huitzo") {
-                            updated.huitzo_version = v;
-                        }
+                        updated.huitzo_version = version;
                         let _ = manifest::save(&updated);
                     }
                 }
@@ -392,14 +398,16 @@ fn pending_launcher_update() -> Option<String> {
 
 /// Bootstrap: discover Python, create venv, install huitzo, write manifest.
 ///
-/// Fetches the release manifest once upfront, then iterates all discovered
-/// Python 3.11+ interpreters in two passes:
-///   Pass 1 — prefer a Python that has a compiled wheel in the manifest.
-///   Pass 2 — if no wheel-compatible Python creates a venv successfully,
-///             fall back to the first working Python (will install from PyPI).
+/// Fetches the release feed once upfront — fatally, since the feed is now the
+/// only source of the CLI — then iterates all discovered Python 3.11+
+/// interpreters, preferring one that has a compiled wheel in that feed. This
+/// avoids committing to Python 3.14 (for example) when only cp312/cp313 wheels
+/// exist and Python 3.12 is also available.
 ///
-/// This avoids committing to Python 3.14 (for example) when only cp312/cp313
-/// wheels exist and Python 3.12 is also available.
+/// Every exit from here is either a working, *verified* CLI or a named cause.
+/// There is no third outcome: the PyPI fallback that used to sit under both
+/// failure branches installed the 0.2.0 "MOVED" placeholder and reported
+/// success (#B4), and is gone rather than flag-gated (D5).
 fn bootstrap() -> Result<(), Error> {
     eprintln!("Setting up huitzo environment...");
 
@@ -423,11 +431,14 @@ fn bootstrap() -> Result<(), Error> {
     // hard to act on.
     let uv_bin = uv::ensure_uv_required()?;
 
-    // Fetch the release manifest once — used to score Python candidates.
-    // Network failure is non-fatal here; we degrade to PyPI fallback.
-    let release = download::fetch_cli_release().ok();
+    // Fetch the release feed once — it both scores the Python candidates and
+    // supplies the only installable artefact. A feed we cannot read is
+    // therefore fatal, and says which kind of unreadable it was: swallowing it
+    // with `.ok()` is what turned a routine GitHub rate-limit 403 into a stub
+    // install on hosts with a perfectly good Python (#M11).
+    let release = download::fetch_cli_release()?;
 
-    let py_used = create_managed_venv(&uv_bin, release.as_ref())?;
+    let py_used = create_managed_venv(&uv_bin, &release)?;
 
     eprintln!(
         "  Using Python {}.{} at {} [{}]",
@@ -437,37 +448,21 @@ fn bootstrap() -> Result<(), Error> {
         py_used.source.label()
     );
 
-    // Install huitzo: try compiled wheel from the already-fetched release, fall back to PyPI
-    eprintln!("  Installing huitzo...");
-    let installed_from_wheel = if let Some(ref rel) = release {
-        match install_from_fetched_release(rel, Some(py_used.version)) {
-            Ok(()) => true,
-            Err(wheel_err) => {
-                eprintln!("  Compiled wheel unavailable ({wheel_err}), falling back to PyPI...");
-                let index_url = std::env::var("HUITZO_INDEX_URL").ok();
-                install::install_package("huitzo", index_url.as_deref())?;
-                false
-            }
-        }
-    } else {
-        // Release fetch failed earlier — go straight to PyPI
-        eprintln!("  Release manifest unavailable, falling back to PyPI...");
-        let index_url = std::env::var("HUITZO_INDEX_URL").ok();
-        install::install_package("huitzo", index_url.as_deref())?;
-        false
-    };
-    let _ = installed_from_wheel; // used implicitly via detect_install_source()
+    // Install huitzo from the compiled wheel. No wheel for this
+    // platform/interpreter is a terminal `Error::NoWheel` naming both and what
+    // the feed does carry — there is nothing else to install.
+    eprintln!("  Installing huitzo {}...", release.version);
+    let wheel = install_from_fetched_release(&release, Some(py_used.version))?;
 
-    // Write manifest
-    let version =
-        install::get_installed_version("huitzo")?.unwrap_or_else(|| "unknown".to_string());
-    eprintln!("  Installed huitzo {version}");
+    // The install is not finished until the environment can actually run the
+    // CLI (#M8). Everything below — the success line, the manifest — is
+    // downstream of this check, so "Installed huitzo X" can no longer be
+    // printed over a venv that cannot import `huitzo_cli`.
+    let version = install::verify_install(&wheel.filename)?;
+    eprintln!("  Installed huitzo {version} — verified `python -m huitzo_cli` can start");
 
     // Check for conflicting pip-installed huitzo
     warn_pip_conflict();
-
-    // Determine install source: GitHub Releases (wheel) vs PyPI fallback
-    let (install_source, wheel_platform) = detect_install_source();
 
     manifest::save(&Manifest {
         schema_version: 3,
@@ -478,8 +473,11 @@ fn bootstrap() -> Result<(), Error> {
         last_update_check: 0, // Force update check on next run
         pending_update: None,
         created_at: manifest::now_secs(),
-        install_source: Some(install_source),
-        wheel_platform,
+        // Wheel-from-release-feed is the only install path there is now, and
+        // the key comes from the wheel actually installed rather than from
+        // re-parsing whatever `.whl` happens to be left in the cache dir.
+        install_source: Some("github_release".to_string()),
+        wheel_platform: Some(wheel.platform_key.clone()),
         active_deployment: None,
         capability_cache: None,
     })?;
@@ -500,9 +498,9 @@ fn bootstrap() -> Result<(), Error> {
 /// `apt install python3` host work without `python3.N-venv` (#B3).
 fn create_managed_venv(
     uv_bin: &Path,
-    release: Option<&download::CliRelease>,
+    release: &download::CliRelease,
 ) -> Result<python::PythonInfo, Error> {
-    let has_wheel = |v: (u8, u8)| release.is_some_and(|r| download::has_wheel_for(r, v));
+    let has_wheel = |v: (u8, u8)| download::has_wheel_for(release, v);
 
     let candidates = python::discover_all();
     let mut searched: Vec<String> = Vec::new();
@@ -625,20 +623,28 @@ fn summarize(err: &Error) -> String {
 /// Download and install a compiled wheel from an already-fetched `CliRelease`.
 ///
 /// `python_version` is used for ABI-specific key lookup (e.g. `macos-arm64-cp313`).
+///
+/// Returns the wheel that was installed, so the caller can record exactly which
+/// platform key it came from instead of inferring it from the cache directory.
 fn install_from_fetched_release(
     release: &download::CliRelease,
     python_version: Option<(u8, u8)>,
-) -> Result<(), Error> {
+) -> Result<&download::WheelInfo, Error> {
     let wheel = download::find_platform_wheel(release, python_version)?;
     let wheel_path = download::download_wheel(&release.version, wheel)?;
     install::install_wheel(&wheel_path)?;
-    Ok(())
+    Ok(wheel)
 }
 
-/// Apply a pending wheel update from GitHub Releases.
-fn apply_wheel_update(python_version: Option<(u8, u8)>) -> Result<(), Error> {
+/// Apply a pending wheel update from GitHub Releases, returning the version the
+/// environment now actually runs.
+///
+/// Verified the same way a first install is (#M8): an update that lands a wheel
+/// the venv cannot import must not be recorded as applied.
+fn apply_wheel_update(python_version: Option<(u8, u8)>) -> Result<String, Error> {
     let release = download::fetch_cli_release()?;
-    install_from_fetched_release(&release, python_version)
+    let wheel = install_from_fetched_release(&release, python_version)?;
+    install::verify_install(&wheel.filename)
 }
 
 /// Parse a Python version string like "3.13" into `(major, minor)`.
@@ -675,33 +681,6 @@ fn warn_pip_conflict() {
             break;
         }
     }
-}
-
-/// Detect how huitzo was installed based on the venv contents.
-///
-/// Returns `(install_source, wheel_platform)`.
-fn detect_install_source() -> (String, Option<String>) {
-    // If a compiled wheel exists in the cache dir, it came from GitHub Releases
-    let cache = dirs::huitzo_home().join("cache");
-    if cache.is_dir() {
-        if let Ok(entries) = std::fs::read_dir(&cache) {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                if name.ends_with(".whl") && name.contains("huitzo") {
-                    // Extract platform tag from wheel filename
-                    // Format: name-version-pyN-pyN-platform.whl
-                    let platform = name
-                        .rsplit('-')
-                        .next()
-                        .and_then(|s| s.strip_suffix(".whl"))
-                        .map(|s| s.to_string());
-                    return ("github_release".to_string(), platform);
-                }
-            }
-        }
-    }
-    ("pypi".to_string(), None)
 }
 
 /// Render the capability report as a human-readable terminal summary for
