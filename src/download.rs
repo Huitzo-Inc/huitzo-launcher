@@ -138,8 +138,15 @@ fn resolve_platform(
 ///
 /// Deliberately not the inverse ("no glibc found ⇒ musl"): a distro that keeps
 /// its loader somewhere unusual (NixOS puts it under `/nix/store`) would be
-/// refused for no reason. A missed musl host still fails safely — it lands on
-/// the existing `Error::NoWheel`, which installs nothing either.
+/// refused for no reason. A missed musl host still fails safely, but later and
+/// less legibly, and `Error::NoWheel` is no longer what catches it: the platform
+/// key is `linux-x86_64` on musl and glibc alike, so since T14 a musl host with
+/// a 3.12/3.13 interpreter reads as wheel-compatible and one without provisions
+/// a managed CPython instead of being refused. Both then fail downstream — pip
+/// rejecting a manylinux wheel (`Error::PipInstall`), or `uv python install`
+/// having no build for the host (`Error::NoPython`). Nothing is installed and no
+/// path reports success, but the message blames pip or uv rather than the libc,
+/// which is why the positive check above has to do the work.
 fn host_is_musl() -> bool {
     if std::path::Path::new("/etc/alpine-release").exists() {
         return true;
