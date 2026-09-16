@@ -632,24 +632,7 @@ fn create_managed_venv(
     // and `Error::NoWheel` is the honest answer — raised here, with nothing
     // downloaded, instead of after.
     if let Some(provisioned) = provisioned_python_version() {
-        // === TEMPORARY DEFECT (T9 proof, reverted in the next commit) ===
-        // The PyPI fallback D5 forbids, re-added at the place it would now be
-        // written: "the feed has no wheel we can use, take the package from
-        // PyPI instead". The exit code is left at 78 on purpose, so what
-        // catches this is the anti-stub assertion, not the status check.
-        if let Err(err) = download::find_platform_wheel(release, Some(provisioned)) {
-            if let Some(py) = no_wheel.first() {
-                eprintln!("  No wheel this launcher can use - falling back to PyPI...");
-                venv::destroy()?;
-                venv::create(uv_bin, py.path.as_os_str())?;
-                let status = std::process::Command::new(dirs::venv_python())
-                    .args(["-m", "pip", "install", "--quiet", "huitzo"])
-                    .status();
-                eprintln!("  PyPI fallback finished: {status:?}");
-            }
-            return Err(err);
-        }
-        // === END TEMPORARY DEFECT ===
+        download::find_platform_wheel(release, Some(provisioned))?;
     }
 
     eprintln!(
@@ -781,19 +764,7 @@ fn install_from_fetched_release(
     release: &download::CliRelease,
     python_version: Option<(u8, u8)>,
 ) -> Result<&download::WheelInfo, Error> {
-    // === TEMPORARY DEFECT (T9 proof): the literal site T2 deleted. ===
-    let wheel = match download::find_platform_wheel(release, python_version) {
-        Ok(w) => w,
-        Err(e) => {
-            eprintln!("  No wheel for this interpreter - falling back to PyPI...");
-            let status = std::process::Command::new(dirs::venv_python())
-                .args(["-m", "pip", "install", "--quiet", "huitzo"])
-                .status();
-            eprintln!("  PyPI fallback finished: {status:?}");
-            return Err(e);
-        }
-    };
-    // === END TEMPORARY DEFECT ===
+    let wheel = download::find_platform_wheel(release, python_version)?;
     let wheel_path = download::download_wheel(&release.version, wheel)?;
     install::install_wheel(&wheel_path)?;
     Ok(wheel)
