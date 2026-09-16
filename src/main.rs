@@ -466,6 +466,13 @@ fn pending_launcher_update() -> Option<String> {
 /// failure branches installed the 0.2.0 "MOVED" placeholder and reported
 /// success (#B4), and is gone rather than flag-gated (D5).
 fn bootstrap() -> Result<(), Error> {
+    // T5/B5/B9: refuse an unsupported host FIRST. This sits above the consent
+    // prompt on purpose — asking someone to approve an install that cannot
+    // succeed, then staging uv and a CPython to prove it, is the failure this
+    // check exists to prevent. On an Intel Mac or an Alpine container the
+    // launcher exits here with $HUITZO_HOME untouched.
+    download::ensure_supported_platform()?;
+
     eprintln!("Setting up huitzo environment...");
 
     // Logged informed consent before installing/executing third-party

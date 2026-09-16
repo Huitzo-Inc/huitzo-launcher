@@ -3,6 +3,7 @@
 
 use std::fmt;
 
+use crate::download::{SUPPORTED_KEYS, UnsupportedReason};
 use crate::python::MIN_PYTHON;
 use crate::uv::PROVISIONED_PYTHON;
 
@@ -70,6 +71,17 @@ pub enum Error {
     /// at all. Collapsing the two is what let a routine GitHub rate-limit 403
     /// install the PyPI stub on a perfectly good host.
     FeedUnavailable { url: String, cause: FeedError },
+    /// This host is not one Huitzo builds for at all (B5, B9, M3, m11).
+    ///
+    /// Distinct from [`Error::NoWheel`], which is "the feed was read and this
+    /// combination is missing from it": here the answer is known before any
+    /// network call, so the refusal happens before consent, before `uv` is
+    /// staged and before a venv exists. Nothing is installed on this path.
+    UnsupportedPlatform {
+        os: String,
+        arch: String,
+        reason: UnsupportedReason,
+    },
     /// The feed was read and carries no wheel this interpreter can install (B4).
     ///
     /// Terminal: the CLI ships only as a compiled wheel, so there is nothing
@@ -207,6 +219,61 @@ impl fmt::Display for Error {
                  past an unreadable feed. Your environment is untouched — retry when the\n\
                  feed is reachable."
             ),
+            Error::UnsupportedPlatform { os, arch, reason } => {
+                // One wording, shared with `install.sh`'s `detect_platform`:
+                // D2 and D8 are one decision each and must not be stated twice
+                // in two voices.
+                let (headline, detected, required, why) = match reason {
+                    UnsupportedReason::IntelMac => (
+                        "Huitzo does not support Intel macOS.",
+                        "macOS on x86_64 (Intel)".to_string(),
+                        "Apple Silicon (arm64 \u{2014} M-series)".to_string(),
+                        "The Huitzo CLI ships only as a compiled wheel and no macos-x86_64 wheel\n\
+                         is published at any Python version, so there is nothing that could be\n\
+                         installed here. Run Huitzo on an Apple Silicon Mac."
+                            .to_string(),
+                    ),
+                    UnsupportedReason::Musl => (
+                        "Huitzo does not support musl-based Linux (Alpine).",
+                        format!("Linux on {arch} with musl libc"),
+                        "glibc".to_string(),
+                        "The Huitzo CLI ships only as a compiled wheel and the release feed\n\
+                         publishes manylinux wheels only \u{2014} there is no musllinux build, so\n\
+                         pip on a musl host has nothing it can install.\n\n\
+                         Use a glibc base image instead (for example `debian-slim` or `ubuntu`),\n\
+                         or, on Windows, WSL2 with Ubuntu."
+                            .to_string(),
+                    ),
+                    UnsupportedReason::WindowsArm => (
+                        "Huitzo does not support Windows on ARM.",
+                        "Windows on aarch64".to_string(),
+                        "Windows on x86_64".to_string(),
+                        "No launcher binary and no pinned uv build is published for this\n\
+                         architecture, so the bootstrap cannot stage itself. x86 emulation is\n\
+                         not supported either: the launcher would still find no wheel for the\n\
+                         host."
+                            .to_string(),
+                    ),
+                    UnsupportedReason::Unknown => (
+                        "Huitzo does not support this platform.",
+                        format!("{os} on {arch}"),
+                        SUPPORTED_KEYS.to_string(),
+                        "The launcher refuses rather than guessing a platform key: asking the\n\
+                         release feed for someone else's wheel would install something this\n\
+                         machine cannot run."
+                            .to_string(),
+                    ),
+                };
+                write!(
+                    f,
+                    "{headline}\n\n\
+                     \x20 Detected: {detected}\n\
+                     \x20 Required: {required}\n\n\
+                     {why}\n\n\
+                     Nothing was installed. See\n\
+                     https://github.com/Huitzo-Inc/huitzo-launcher/blob/main/docs/SUPPORT_MATRIX.md"
+                )
+            }
             Error::NoWheel {
                 platform,
                 python_version,
@@ -249,10 +316,11 @@ impl fmt::Display for Error {
                      https://github.com/Huitzo-Inc/huitzo-launcher/issues",
                     if other_pythons.is_empty() {
                         // No wheel for this platform at ANY Python version.
-                        // T5 seam: on `macos-x86_64` this is where the D2
-                        // "Apple Silicon required" refusal belongs — T5 owns
-                        // refusing before the venv is ever built, so this
-                        // generic message is the placeholder, not the answer.
+                        // A *supported* platform in this state means the feed
+                        // dropped a build it used to ship; the unsupported
+                        // platforms themselves (Intel macOS, musl) never get
+                        // here — `Error::UnsupportedPlatform` refuses them
+                        // before the feed is even fetched.
                         format!(
                             "The CLI ships as a compiled wheel and there is no {platform} build \
                              at any\nPython version, so no interpreter on this machine can run it.\n\n"
@@ -426,6 +494,9 @@ pub fn exit_code(err: &Error) -> i32 {
         // a configuration fact the user can act on, distinct from a 69 outage
         // that is worth retrying verbatim.
         Error::NoWheel { .. } => 78, // EX_CONFIG
+        // Same family as NoWheel and for the same reason: the machine is the
+        // fact. A wrapper script must not retry this the way it retries a 69.
+        Error::UnsupportedPlatform { .. } => 78, // EX_CONFIG
         // The host is fine, the launcher is stale: the user fixes it by
         // upgrading, exactly like NoWheel is fixed by changing platform (M10).
         Error::LauncherTooOld { .. } => 78, // EX_CONFIG

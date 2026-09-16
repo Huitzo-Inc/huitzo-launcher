@@ -13,8 +13,10 @@
 #   3. Runs a capability check (huitzo / claude / git) so you know exactly
 #      what is present and what is still missing — all in one shot.
 #
-# Supported: macOS, Linux, and WSL2. Native Windows (non-WSL) and
-# admin-locked corporate machines are NOT yet officially supported — see
+# Supported: macOS on Apple Silicon, Linux on glibc (x86_64 / aarch64), and
+# WSL2. Intel macOS (D2), musl/Alpine (D8), native Windows (non-WSL) and
+# admin-locked corporate machines are NOT supported — detect_platform refuses
+# the first two before anything is downloaded. See
 # https://github.com/Huitzo-Inc/huitzo-launcher/blob/main/docs/SUPPORT_MATRIX.md
 #
 # Environment variables:
@@ -115,6 +117,38 @@ consent_gate() {
     export HUITZO_BOOTSTRAP_CONSENTED=1
 }
 
+# Does this host run musl libc rather than glibc?
+#
+# Mirrors `host_is_musl()` in src/download.rs and must stay in step with it:
+# positive evidence only, and an explicit glibc check so `apt install musl` on
+# a Debian host does not get that host refused. `ldd --version` is not used —
+# busybox's ldd on Alpine writes usage to stderr and exits non-zero, so the
+# check would have to parse a failure, whereas the loader path is a plain
+# filesystem fact present on every musl system.
+host_is_musl() {
+    [ -f /etc/alpine-release ] && return 0
+    for loader in /lib/ld-musl-*.so.1; do
+        [ -e "$loader" ] || continue
+        # A musl loader alongside a glibc one means a cross-libc toolchain on a
+        # glibc host, which is supported.
+        for glibc in /lib/x86_64-linux-gnu/libc.so.6 /lib/aarch64-linux-gnu/libc.so.6 \
+                     /lib64/libc.so.6 /lib/libc.so.6 /lib64/ld-linux-x86-64.so.2 \
+                     /lib/ld-linux-aarch64.so.1; do
+            [ -e "$glibc" ] && return 1
+        done
+        return 0
+    done
+    return 1
+}
+
+# Refuse an unsupported host BEFORE anything is fetched. `main` calls this
+# first, ahead of the consent prompt and the launcher download, so an Intel Mac
+# or an Alpine container never gets asked to approve an install that cannot
+# work and never has a byte written to $HUITZO_HOME.
+#
+# The wording here is the same wording the launcher itself prints
+# (`Error::UnsupportedPlatform` in src/errors.rs) — D2 and D8 are one decision
+# each, stated once.
 detect_platform() {
     OS=$(uname -s | tr '[:upper:]' '[:lower:]')
     ARCH=$(uname -m)
@@ -122,14 +156,68 @@ detect_platform() {
     case "$OS" in
         linux)  OS_TARGET="unknown-linux-musl" ;;
         darwin) OS_TARGET="apple-darwin" ;;
-        *) echo "Error: Unsupported OS: $OS"; exit 1 ;;
+        *)
+            echo "Error: Huitzo does not support this platform."
+            echo "  Detected: $OS on $ARCH"
+            echo "  Required: macOS (Apple Silicon), Linux/glibc (x86_64, aarch64), or Windows (x86_64)"
+            echo ""
+            echo "Nothing was installed. See"
+            echo "https://github.com/Huitzo-Inc/huitzo-launcher/blob/main/docs/SUPPORT_MATRIX.md"
+            exit 1
+            ;;
     esac
 
     case "$ARCH" in
         x86_64|amd64)  ARCH_TARGET="x86_64" ;;
         aarch64|arm64) ARCH_TARGET="aarch64" ;;
-        *) echo "Error: Unsupported architecture: $ARCH"; exit 1 ;;
+        *)
+            echo "Error: Huitzo does not support this platform."
+            echo "  Detected: $OS on $ARCH"
+            echo "  Required: Apple Silicon (arm64), or Linux/glibc on x86_64 or aarch64"
+            echo ""
+            echo "Nothing was installed. See"
+            echo "https://github.com/Huitzo-Inc/huitzo-launcher/blob/main/docs/SUPPORT_MATRIX.md"
+            exit 1
+            ;;
     esac
+
+    # D2 — Intel macOS is unsupported. The CLI ships only as a compiled wheel
+    # and cli-release.json carries macos-arm64 keys only; there is no
+    # macos-x86_64 build at any Python version, so the launcher would download
+    # and then find nothing to install.
+    if [ "$OS" = "darwin" ] && [ "$ARCH_TARGET" = "x86_64" ]; then
+        echo "Error: Huitzo does not support Intel macOS."
+        echo "  Detected: macOS on x86_64 (Intel)"
+        echo "  Required: Apple Silicon (arm64 — M-series)"
+        echo ""
+        echo "The Huitzo CLI ships only as a compiled wheel and no macos-x86_64 wheel"
+        echo "is published at any Python version, so there is nothing that could be"
+        echo "installed here. Run Huitzo on an Apple Silicon Mac."
+        echo ""
+        echo "Nothing was installed. See"
+        echo "https://github.com/Huitzo-Inc/huitzo-launcher/blob/main/docs/SUPPORT_MATRIX.md"
+        exit 1
+    fi
+
+    # D8 — musl/Alpine is unsupported. The release feed publishes manylinux
+    # wheels only (zero musllinux), and pip on a musl host computes
+    # musllinux_* tags and rejects every one of them.
+    if [ "$OS" = "linux" ] && host_is_musl; then
+        echo "Error: Huitzo does not support musl-based Linux (Alpine)."
+        echo "  Detected: Linux on $ARCH_TARGET with musl libc"
+        echo "  Required: glibc"
+        echo ""
+        echo "The Huitzo CLI ships only as a compiled wheel and the release feed"
+        echo "publishes manylinux wheels only — there is no musllinux build, so pip on"
+        echo "a musl host has nothing it can install."
+        echo ""
+        echo "Use a glibc base image instead (for example \`debian-slim\` or \`ubuntu\`),"
+        echo "or, on Windows, WSL2 with Ubuntu."
+        echo ""
+        echo "Nothing was installed. See"
+        echo "https://github.com/Huitzo-Inc/huitzo-launcher/blob/main/docs/SUPPORT_MATRIX.md"
+        exit 1
+    fi
 
     ASSET="huitzo-${ARCH_TARGET}-${OS_TARGET}"
     echo "  Platform: ${ARCH_TARGET}-${OS_TARGET}"

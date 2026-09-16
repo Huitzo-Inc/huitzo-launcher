@@ -30,31 +30,150 @@ pub struct WheelInfo {
     pub sha256: String,
 }
 
-/// Returns the base platform key for the current OS/architecture.
+/// Why this host cannot install the Huitzo CLI.
+///
+/// Each variant is a founder decision plus a fact about the published feed,
+/// not a guess: the CLI ships **only** as a compiled wheel, so a host with no
+/// wheel has nothing to install and no fallback to degrade into (D5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnsupportedReason {
+    /// D2 — Intel macOS. `cli-release.json` carries `macos-arm64-cp312` and
+    /// `macos-arm64-cp313` and no `macos-x86_64` key at any Python version.
+    IntelMac,
+    /// D8 — musl/Alpine. `cli-v0.11.1` publishes 8 wheels, every Linux one
+    /// `manylinux2014`/`manylinux_2_17`/`manylinux_2_28`; zero `musllinux`.
+    /// pip on a musl host computes `musllinux_*` tags and rejects all of them.
+    Musl,
+    /// m11 — Windows on ARM. No launcher asset and no pinned `uv` asset is
+    /// published for `aarch64-pc-windows-*`, so the bootstrap cannot even
+    /// stage itself, let alone find a wheel.
+    WindowsArm,
+    /// M3 — anything else. Previously these fell through a catch-all `else`
+    /// and asked the feed for `linux-x86_64`.
+    Unknown,
+}
+
+/// The platform keys the release feed is built around, for error messages.
+pub const SUPPORTED_KEYS: &str =
+    "macos-arm64, linux-x86_64 (glibc), linux-aarch64 (glibc), windows-x86_64";
+
+/// Returns the base platform key for the current OS/architecture, or the
+/// reason this host has no key at all.
 ///
 /// Must match the prefix used in cli-release.json:
-/// linux-x86_64, linux-aarch64, macos-x86_64, macos-arm64, windows-x86_64
+/// linux-x86_64, linux-aarch64, macos-arm64, windows-x86_64
 ///
-/// `macos-x86_64` is a key no release will ever carry (D2 — Intel macOS is
-/// unsupported). It is still produced here so the miss is reported honestly by
-/// [`find_platform_wheel`] rather than silently mapped onto the arm64 build.
-/// **T5 seam:** the explicit "Apple Silicon required" refusal belongs upstream
-/// of this — before a venv is built — and is T5's to add; this function and
-/// `Error::NoWheel` are the fallback, not that refusal.
-pub fn current_platform() -> &'static str {
-    if cfg!(target_os = "linux") && cfg!(target_arch = "x86_64") {
-        "linux-x86_64"
-    } else if cfg!(target_os = "linux") && cfg!(target_arch = "aarch64") {
-        "linux-aarch64"
-    } else if cfg!(target_os = "macos") && cfg!(target_arch = "x86_64") {
-        "macos-x86_64"
-    } else if cfg!(target_os = "macos") && cfg!(target_arch = "aarch64") {
-        "macos-arm64"
-    } else if cfg!(target_os = "windows") && cfg!(target_arch = "x86_64") {
-        "windows-x86_64"
-    } else {
-        "linux-x86_64" // fallback
+/// There is deliberately no fallback key (M3): a host we do not recognise gets
+/// an error naming what was detected, never a guess that sends a Windows-on-ARM
+/// machine to fetch a Linux wheel.
+pub fn current_platform() -> Result<&'static str, Error> {
+    // `std::env::consts::OS`/`ARCH` are compile-time target facts, which is
+    // exactly right for OS and architecture — a binary cannot run on a
+    // different one. libc is NOT such a fact: this launcher is built for
+    // `x86_64-unknown-linux-musl` specifically so one binary runs everywhere,
+    // so `cfg!(target_env = "musl")` is true on Debian and Alpine alike and
+    // describes the launcher, not the host. Hence the runtime probe (B9).
+    resolve_platform(std::env::consts::OS, std::env::consts::ARCH, host_is_musl)
+}
+
+/// Refuse, loudly and early, if this host has no wheel — before consent is
+/// asked, before `uv` is staged, before a venv exists.
+///
+/// The bootstrap path calls this first so an unsupported machine ends with an
+/// explanation and an empty `$HUITZO_HOME`, rather than downloading a toolchain
+/// to discover the same thing three steps later (B5, B9).
+pub fn ensure_supported_platform() -> Result<(), Error> {
+    current_platform().map(|_| ())
+}
+
+/// The OS/arch/libc → platform-key mapping, with the libc probe injected.
+///
+/// Separated from [`current_platform`] so every branch — including the ones
+/// this machine can never take, such as Intel macOS — is reachable from a test
+/// without a Mac, an Alpine box or a Windows-on-ARM laptop.
+///
+/// `is_musl` is a closure, not a `bool`, so the filesystem probe never runs on
+/// a platform where the answer cannot matter (it is a match guard, hence `Fn`).
+fn resolve_platform(
+    os: &str,
+    arch: &str,
+    is_musl: impl Fn() -> bool,
+) -> Result<&'static str, Error> {
+    let refuse = |reason| {
+        Err(Error::UnsupportedPlatform {
+            os: os.to_string(),
+            arch: arch.to_string(),
+            reason,
+        })
+    };
+
+    match (os, arch) {
+        // Linux is the only platform where libc is a question, and it is
+        // asked before the key is handed out — a musl host that resolved
+        // `linux-x86_64` would go on to install a manylinux wheel pip cannot
+        // accept, which is precisely #B9.
+        ("linux", "x86_64" | "aarch64") if is_musl() => refuse(UnsupportedReason::Musl),
+        ("linux", "x86_64") => Ok("linux-x86_64"),
+        ("linux", "aarch64") => Ok("linux-aarch64"),
+        ("macos", "aarch64") => Ok("macos-arm64"),
+        ("macos", "x86_64") => refuse(UnsupportedReason::IntelMac),
+        ("windows", "x86_64") => Ok("windows-x86_64"),
+        ("windows", "aarch64") => refuse(UnsupportedReason::WindowsArm),
+        _ => refuse(UnsupportedReason::Unknown),
     }
+}
+
+/// Does the *host* run musl libc rather than glibc?
+///
+/// Positive evidence only, and evidence that survives a cross-libc developer
+/// machine:
+///
+/// * `/etc/alpine-release` — Alpine is musl by construction. Even with
+///   `gcompat` installed the interpreter still tags itself `musllinux_*`, so
+///   pip rejects the manylinux wheels regardless; Alpine is out either way.
+/// * a `ld-musl-*.so.1` loader in `/lib` **and no glibc loader anywhere**.
+///   The second half matters: `apt install musl` on Debian drops
+///   `/lib/ld-musl-x86_64.so.1` onto a perfectly supported glibc host, and
+///   refusing to install there would be a worse bug than the one being fixed.
+///
+/// Deliberately not the inverse ("no glibc found ⇒ musl"): a distro that keeps
+/// its loader somewhere unusual (NixOS puts it under `/nix/store`) would be
+/// refused for no reason. A missed musl host still fails safely — it lands on
+/// the existing `Error::NoWheel`, which installs nothing either.
+fn host_is_musl() -> bool {
+    if std::path::Path::new("/etc/alpine-release").exists() {
+        return true;
+    }
+    has_musl_loader() && !has_glibc_loader()
+}
+
+/// musl's loader is always `/lib/ld-musl-$ARCH.so.1`. Scanning the directory
+/// rather than building the name keeps this correct on architectures the
+/// launcher is not itself built for.
+fn has_musl_loader() -> bool {
+    let Ok(entries) = std::fs::read_dir("/lib") else {
+        return false;
+    };
+    entries.flatten().any(|e| {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        name.starts_with("ld-musl-") && name.ends_with(".so.1")
+    })
+}
+
+/// glibc's loader and runtime, across the layouts in use: multiarch (Debian,
+/// Ubuntu), `/lib64` (RHEL, Fedora, SUSE) and merged-`/usr` symlinks.
+fn has_glibc_loader() -> bool {
+    [
+        "/lib/x86_64-linux-gnu/libc.so.6",
+        "/lib/aarch64-linux-gnu/libc.so.6",
+        "/lib64/libc.so.6",
+        "/lib/libc.so.6",
+        "/lib64/ld-linux-x86-64.so.2",
+        "/lib/ld-linux-aarch64.so.1",
+    ]
+    .iter()
+    .any(|p| std::path::Path::new(p).exists())
 }
 
 /// How long the launcher will wait on the release feed before calling it
@@ -270,7 +389,11 @@ pub fn find_platform_wheel(
     release: &CliRelease,
     python_version: Option<(u8, u8)>,
 ) -> Result<&WheelInfo, Error> {
-    let platform = current_platform();
+    // An unsupported host never reaches a wheel lookup on the bootstrap path
+    // (`ensure_supported_platform` refuses first), but this is the function
+    // that decides what gets installed, so it re-asks rather than assuming a
+    // key exists.
+    let platform = current_platform()?;
 
     // 1. Try Python-version-specific key (e.g. "macos-arm64-cp313")
     if let Some((major, minor)) = python_version {
@@ -463,6 +586,13 @@ mod tests {
         }
     }
 
+    /// The platform key for the machine running the suite. CI and every
+    /// developer host is a supported platform, so a failure here is a real
+    /// regression in the mapping and not a skip condition.
+    fn this_platform() -> &'static str {
+        current_platform().expect("the test host must resolve to a supported platform")
+    }
+
     fn make_release(keys: &[&str]) -> CliRelease {
         CliRelease {
             version: "0.2.3".to_string(),
@@ -478,13 +608,41 @@ mod tests {
         }
     }
 
+    // --- B5 / B9 / M3 / m11: the platform mapping refuses, never guesses ---
+
+    /// Resolve a forced OS/arch/libc triple. This is criterion 3's
+    /// "test exercising the mapping with a forced platform value": every
+    /// branch below runs on this Linux CI host, including the Mac and Windows
+    /// ones, because `resolve_platform` takes the triple as arguments.
+    fn resolve(os: &str, arch: &str, musl: bool) -> Result<&'static str, Error> {
+        resolve_platform(os, arch, || musl)
+    }
+
+    fn refusal(os: &str, arch: &str, musl: bool) -> (UnsupportedReason, String) {
+        match resolve(os, arch, musl) {
+            Err(Error::UnsupportedPlatform { reason, os, arch }) => {
+                let rendered = Error::UnsupportedPlatform {
+                    reason,
+                    os: os.clone(),
+                    arch: arch.clone(),
+                }
+                .to_string();
+                // Captured by default; `cargo test -- --nocapture` shows each
+                // refusal exactly as a user on that host would read it.
+                println!("--- {os}/{arch} (musl={musl}) ---\n{rendered}\n");
+                (reason, rendered)
+            }
+            Err(other) => panic!("expected UnsupportedPlatform, got: {other}"),
+            Ok(key) => panic!("expected a refusal for {os}/{arch}, got key {key}"),
+        }
+    }
+
     #[test]
     fn current_platform_returns_valid_key() {
-        let platform = current_platform();
+        let platform = this_platform();
         let valid = [
             "linux-x86_64",
             "linux-aarch64",
-            "macos-x86_64",
             "macos-arm64",
             "windows-x86_64",
         ];
@@ -492,11 +650,142 @@ mod tests {
             valid.contains(&platform),
             "Unknown platform key: {platform}"
         );
+        // `macos-x86_64` is not in that list and must never be produced again:
+        // no release carries the key, so it could only ever be a 404 (B5).
+        assert_ne!(platform, "macos-x86_64");
+    }
+
+    #[test]
+    fn supported_hosts_map_to_the_feed_keys() {
+        assert_eq!(resolve("linux", "x86_64", false).unwrap(), "linux-x86_64");
+        assert_eq!(resolve("linux", "aarch64", false).unwrap(), "linux-aarch64");
+        assert_eq!(resolve("macos", "aarch64", false).unwrap(), "macos-arm64");
+        assert_eq!(
+            resolve("windows", "x86_64", false).unwrap(),
+            "windows-x86_64"
+        );
+    }
+
+    #[test]
+    fn intel_macos_is_refused_by_name_not_handed_a_wheel() {
+        let (reason, msg) = refusal("macos", "x86_64", false);
+        assert_eq!(reason, UnsupportedReason::IntelMac);
+        assert!(msg.contains("Apple Silicon"), "{msg}");
+        assert!(msg.contains("Intel"), "{msg}");
+        assert!(msg.contains("x86_64"), "{msg}");
+        assert!(msg.contains("Nothing was installed"), "{msg}");
+        // The bug was that it resolved a key at all.
+        assert!(!msg.contains("macos-arm64-cp"), "{msg}");
+    }
+
+    #[test]
+    fn a_musl_host_is_refused_with_glibc_required_and_a_named_alternative() {
+        for arch in ["x86_64", "aarch64"] {
+            let (reason, msg) = refusal("linux", arch, true);
+            assert_eq!(reason, UnsupportedReason::Musl);
+            assert!(msg.contains("musl"), "{msg}");
+            assert!(msg.contains("glibc"), "{msg}");
+            // D8 requires naming a glibc alternative, not just the diagnosis.
+            assert!(msg.contains("debian-slim"), "{msg}");
+            assert!(msg.contains("ubuntu"), "{msg}");
+            assert!(msg.contains("WSL2"), "{msg}");
+            assert!(msg.contains(arch), "{msg}");
+        }
+        // The same arch on glibc is supported — the refusal is about libc, not
+        // about Linux, so a test that passed with the libc probe deleted would
+        // fail right here.
+        assert!(resolve("linux", "x86_64", false).is_ok());
+        assert!(resolve("linux", "aarch64", false).is_ok());
+    }
+
+    #[test]
+    fn windows_on_arm_is_refused_by_name() {
+        let (reason, msg) = refusal("windows", "aarch64", false);
+        assert_eq!(reason, UnsupportedReason::WindowsArm);
+        assert!(msg.contains("Windows on ARM"), "{msg}");
+        assert!(msg.contains("aarch64"), "{msg}");
+    }
+
+    #[test]
+    fn an_unknown_host_errors_instead_of_claiming_linux_x86_64() {
+        // M3: every one of these used to fall through the catch-all `else`
+        // and ask the feed for a Linux wheel.
+        for (os, arch) in [
+            ("freebsd", "x86_64"),
+            ("linux", "riscv64"),
+            ("linux", "s390x"),
+            ("macos", "powerpc64"),
+            ("solaris", "sparc64"),
+            ("haiku", "x86"),
+        ] {
+            let (reason, msg) = refusal(os, arch, false);
+            assert_eq!(reason, UnsupportedReason::Unknown, "{os}/{arch}");
+            assert!(msg.contains(os), "{msg}");
+            assert!(msg.contains(arch), "{msg}");
+            // The whole point of M3: no guessed key anywhere in the output.
+            assert!(
+                !msg.contains("linux-x86_64,") && !msg.contains("Detected: linux-x86_64"),
+                "unknown host must not be handed a key: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_advertised_key_list_is_exactly_what_the_mapping_can_produce() {
+        // `SUPPORTED_KEYS` is printed to a user who has just been refused. If
+        // it drifted from the `Ok` arms it would send someone to a platform
+        // the launcher would then also refuse.
+        let produced: Vec<&str> = [
+            ("macos", "aarch64"),
+            ("linux", "x86_64"),
+            ("linux", "aarch64"),
+            ("windows", "x86_64"),
+        ]
+        .iter()
+        .map(|(os, arch)| resolve(os, arch, false).unwrap())
+        .collect();
+        for key in &produced {
+            assert!(
+                SUPPORTED_KEYS.contains(key),
+                "{key} is produced but not advertised: {SUPPORTED_KEYS}"
+            );
+        }
+        // …and nothing is advertised that cannot be produced.
+        for advertised in SUPPORTED_KEYS.split(", ") {
+            let key = advertised.split_whitespace().next().unwrap();
+            assert!(
+                produced.contains(&key),
+                "{key} is advertised but no host maps to it"
+            );
+        }
+    }
+
+    #[test]
+    fn the_refusal_exit_code_is_config_not_a_retryable_outage() {
+        let e = Error::UnsupportedPlatform {
+            os: "linux".to_string(),
+            arch: "x86_64".to_string(),
+            reason: UnsupportedReason::Musl,
+        };
+        assert_eq!(crate::errors::exit_code(&e), 78, "EX_CONFIG");
+    }
+
+    #[test]
+    fn the_libc_probe_agrees_with_this_host() {
+        // The launcher is built for x86_64-unknown-linux-musl, so
+        // `cfg!(target_env = "musl")` is true in this very binary. The probe
+        // must disagree with it on a glibc host — that inversion IS B9.
+        if cfg!(target_os = "linux") {
+            assert!(
+                !host_is_musl() || std::path::Path::new("/etc/alpine-release").exists(),
+                "glibc host classified as musl"
+            );
+        }
     }
 
     #[test]
     fn find_platform_wheel_prefers_abi_key() {
-        let platform = current_platform();
+        let platform = this_platform();
         let abi_key = format!("{platform}-cp313");
         let release = make_release(&[&abi_key, platform]);
 
@@ -509,7 +798,7 @@ mod tests {
 
     #[test]
     fn find_platform_wheel_falls_back_to_platform_key() {
-        let platform = current_platform();
+        let platform = this_platform();
         let release = make_release(&[platform]);
 
         let wheel = find_platform_wheel(&release, Some((3, 13))).unwrap();
@@ -518,7 +807,7 @@ mod tests {
 
     #[test]
     fn find_platform_wheel_abi_only_manifest() {
-        let platform = current_platform();
+        let platform = this_platform();
         let abi_key = format!("{platform}-cp311");
         let release = make_release(&[&abi_key]);
 
@@ -528,7 +817,7 @@ mod tests {
 
     #[test]
     fn find_platform_wheel_abi_mismatch_falls_back() {
-        let platform = current_platform();
+        let platform = this_platform();
         let abi_key = format!("{platform}-cp311");
         let release = make_release(&[&abi_key, platform]);
 
@@ -541,7 +830,7 @@ mod tests {
 
     #[test]
     fn find_platform_wheel_no_python_version_uses_platform_key() {
-        let platform = current_platform();
+        let platform = this_platform();
         let release = make_release(&[platform]);
 
         let wheel = find_platform_wheel(&release, None).unwrap();
@@ -551,7 +840,7 @@ mod tests {
     #[test]
     fn find_platform_wheel_returns_error_when_no_match() {
         let release = make_release(&["linux-x86_64-cp310"]);
-        let platform = current_platform();
+        let platform = this_platform();
         let abi_key = format!("{platform}-cp310");
         if release
             .wheels
@@ -859,7 +1148,7 @@ mod tests {
     fn a_missing_wheel_names_the_platform_the_interpreter_and_the_feed() {
         // A feed that carries this platform, but only for other Pythons —
         // exactly the Python-3.11-only host in #B4.
-        let platform = current_platform();
+        let platform = this_platform();
         let release = make_release(&[
             &format!("{platform}-cp313"),
             &format!("{platform}-cp312"),
@@ -896,10 +1185,11 @@ mod tests {
 
     #[test]
     fn a_platform_with_no_wheels_at_all_says_so_rather_than_blaming_the_python() {
-        // The #B5 / Intel-macOS shape: the feed has no build for this platform
-        // at any interpreter version. T5 replaces this with the explicit
-        // "Apple Silicon required" refusal; until then it must not read as
-        // "install a different Python".
+        // A *supported* platform the feed has dropped a build for at every
+        // interpreter version. (Intel macOS no longer reaches this message —
+        // `Error::UnsupportedPlatform` refuses it first — so what is left here
+        // is a feed regression, and it must not read as "install a different
+        // Python".)
         let release = make_release(&["some-other-platform-cp312"]);
         let msg = find_platform_wheel(&release, Some((3, 13)))
             .unwrap_err()
