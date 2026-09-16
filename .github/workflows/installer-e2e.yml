@@ -318,8 +318,8 @@ jobs:
         shell: powershell
         run: |
           # The runner injects `$ErrorActionPreference = 'stop'`, under which a
-          # native command writing to stderr — which the launcher's whole
-          # bootstrap progress is — raises a terminating error. Exit codes are
+          # native command writing to stderr - which the launcher's whole
+          # bootstrap progress is - raises a terminating error. Exit codes are
           # the contract here, and they are checked explicitly below.
           $ErrorActionPreference = 'Continue'
 
@@ -373,7 +373,7 @@ jobs:
             Write-Host "python.exe: not on PATH.  py launcher: $($py.Source)"
             & $py.Source -0p
           } else {
-            Write-Host "::warning::no py launcher on this runner image — this run covers 'no python.exe on PATH' only"
+            Write-Host "::warning::no py launcher on this runner image - this run covers no-python.exe-on-PATH only"
           }
 
           $env:HUITZO_HOME = Join-Path $env:RUNNER_TEMP 'home-pylauncher'
