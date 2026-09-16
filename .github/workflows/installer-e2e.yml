@@ -106,6 +106,8 @@ jobs:
           "$HUITZO_HOME/bin/huitzo" --version | tee "$RUNNER_TEMP/version.txt"
           # The whole point: a `huitzo-cli` version line, not `--launcher-version`.
           grep -qE '^huitzo-cli [0-9]+\.[0-9]+' "$RUNNER_TEMP/version.txt"
+          # ... and it is the feed's wheel, not the 0.2.0 PyPI placeholder (#B4).
+          ./scripts/assert_install_outcome.sh installed "$RUNNER_TEMP/version.txt"
 
       # ---- B2: a host with no Python at all --------------------------------
       # `ubuntu:22.04` ships no `python3`. Before D1 this dead-ended in "install
@@ -129,12 +131,16 @@ jobs:
               sh /repo/install.sh
               "$HUITZO_HOME/bin/huitzo" --version | tee /tmp/version.txt
               grep -qE "^huitzo-cli [0-9]+\.[0-9]+" /tmp/version.txt
+              sh /repo/scripts/assert_install_outcome.sh installed /tmp/version.txt
             '
 
       # ---- B3: python3 without the distro venv package ----------------------
       # Debian/Ubuntu split `ensurepip` into `python3.N-venv`, so `python -m
       # venv` fails on a stock `apt install python3`. The launcher builds the
       # environment with `uv venv`, which needs no such package.
+      #
+      # Doubles as T14's no-regression half: 3.12 CAN take a published wheel, so
+      # it must still be reused and no managed CPython downloaded.
       - name: 'B3 — ubuntu:24.04 with python3 but no python3.12-venv reaches a working CLI'
         run: |
           set -euo pipefail
@@ -150,19 +156,38 @@ jobs:
               python3 -V
               # Positive proof the trap is armed: `python -m venv` must fail here.
               if python3 -m venv /tmp/proof >/dev/null 2>&1; then
-                echo "::error::python3-venv is present — this case is no longer testing B3"; exit 1
+                echo "::error::python3-venv is present, this case is no longer testing B3"; exit 1
               fi
               echo "confirmed: python -m venv fails on this host"
-              sh /repo/install.sh
-              "$HUITZO_HOME/bin/huitzo" --version | tee /tmp/version.txt
+              sh /repo/install.sh > /tmp/install.log 2>&1 || { cat /tmp/install.log; exit 1; }
+
+              "$HUITZO_HOME/bin/huitzo" --version > /tmp/version.txt 2>/tmp/run.log
+              cat /tmp/run.log /tmp/version.txt
               grep -qE "^huitzo-cli [0-9]+\.[0-9]+" /tmp/version.txt
+              sh /repo/scripts/assert_install_outcome.sh installed /tmp/version.txt
+
+              # T14 no-regression: the wheel-compatible system Python is reused.
+              grep -q "Trying Python 3.12 at /usr/bin/python3.12" /tmp/run.log
+              if [ -d "$HUITZO_HOME/python" ]; then
+                echo "::error::a managed CPython was downloaded although python3.12 can take a wheel"
+                exit 1
+              fi
+              echo "confirmed: /usr/bin/python3.12 reused, no managed CPython downloaded"
             '
 
-      # ---- B4: an interpreter the feed publishes no wheel for ---------------
-      # This used to "succeed" by falling back to PyPI, where the name `huitzo`
-      # resolved to an unrelated 0.2.0 placeholder. The fallback is gone (T2),
-      # so the run must FAIL — and, critically, must leave nothing installed.
-      - name: 'B4 — ubuntu:22.04 with only python3.11 fails clean and installs no stub'
+      # ---- B4 / T14: the only host Python cannot take a published wheel -----
+      # Was a FAILURE case in this suite until T14 (#67) landed. The feed ships
+      # cp312/cp313; a host whose only interpreter is 3.11 — Debian 12 stock,
+      # Ubuntu 22.04 + `python3.11` — used to get a 3.11 venv built on it and
+      # then be refused with exit 78. It now provisions a managed CPython, the
+      # same rescue a host with no Python at all already got.
+      #
+      # The #B4 guard does NOT disappear with the old exit code: this case still
+      # proves the 0.2.0 PyPI placeholder cannot be what lands. It asserts the
+      # opposite half of the invariant — that what got installed is the feed's
+      # wheel — via scripts/assert_install_outcome.sh. The refusal half now
+      # lives on the two cases below.
+      - name: 'B4/T14 — ubuntu:22.04 with only python3.11 provisions and installs the real wheel'
         run: |
           set -euo pipefail
           docker run --rm \
@@ -175,31 +200,119 @@ jobs:
               apt-get update -qq >/dev/null
               apt-get install -y -qq curl ca-certificates python3.11 >/dev/null
               ls /usr/bin/python3*
+              if [ -e /usr/bin/python3.12 ] || [ -e /usr/bin/python3.13 ]; then
+                echo "::error::a wheel-compatible Python is present, this case is not testing T14"; exit 1
+              fi
               sh /repo/install.sh > /tmp/install.log 2>&1 || { cat /tmp/install.log; exit 1; }
 
+              "$HUITZO_HOME/bin/huitzo" --version > /tmp/version.txt 2>/tmp/run.log
+              cat /tmp/run.log /tmp/version.txt
+
+              # 3.11 is named and skipped, never built on.
+              grep -q "Skipping Python 3.11 at /usr/bin/python3.11" /tmp/run.log
+              grep -q "publishes no wheel for it" /tmp/run.log
+              if grep -q "Trying Python 3.11" /tmp/run.log; then
+                echo "::error::3.11 was built on despite having no wheel - T14 regressed"; exit 1
+              fi
+              # ... and a managed CPython is provisioned instead.
+              grep -q "No system Python can install a cli-v.* wheel" /tmp/run.log
+              grep -qE "Using Python 3\.1[0-9] at .*/python/cpython-.* \[uv-managed\]" /tmp/run.log
+
+              grep -qE "^huitzo-cli [0-9]+\.[0-9]+" /tmp/version.txt
+              # The #B4 half that survives: what landed is the feed wheel.
+              sh /repo/scripts/assert_install_outcome.sh installed /tmp/version.txt
+            '
+
+      # ---- B4 guard (a): the feed serves no wheel this launcher can use -----
+      # Post-T14 this is the reachable `Error::NoWheel`, and therefore where a
+      # reintroduced PyPI fallback would now be exercised. The launcher skips the
+      # host 3.12 (this feed publishes cp311 only), asks the feed whether it can
+      # serve the CPython it would provision, and refuses BEFORE spending the
+      # ~25 MB download.
+      #
+      # The feed is served from inside the container on 127.0.0.1, so the case is
+      # deterministic and never depends on what the live feed happens to publish.
+      - name: 'B4 guard — a feed with no usable wheel refuses at 78 and installs nothing'
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "$RUNNER_TEMP/asset:/asset:ro" -v "$PWD:/repo:ro" \
+            -e HUITZO_HOME=/tmp/huitzo-home \
+            -e HUITZO_NO_MODIFY_PATH=1 -e HUITZO_ASSUME_YES=1 \
+            -e "GITHUB_TOKEN=$GITHUB_TOKEN" \
+            -e "HUITZO_LAUNCHER_ASSET_URL=file:///asset/$ASSET" \
+            ubuntu:24.04 bash -euo pipefail -c '
+              apt-get update -qq >/dev/null
+              apt-get install -y -qq curl ca-certificates python3 >/dev/null
+
+              # A feed that publishes cp311 only: neither the host 3.12 nor the
+              # CPython the launcher provisions can be served by it.
+              mkdir -p /feed
+              SHA=0000000000000000000000000000000000000000000000000000000000000000
+              printf "%s" "{\"version\":\"0.11.1\",\"min_launcher_version\":\"0.1.0\",\"wheels\":{\"linux-x86_64-cp311\":{\"filename\":\"huitzo-0.11.1-cp311-cp311-manylinux_2_17_x86_64.whl\",\"sha256\":\"$SHA\"},\"linux-aarch64-cp311\":{\"filename\":\"huitzo-0.11.1-cp311-cp311-manylinux_2_17_aarch64.whl\",\"sha256\":\"$SHA\"}}}" > /feed/cli-release.json
+              printf "%s" "[{\"tag_name\":\"cli-v0.11.1\",\"draft\":false,\"prerelease\":true,\"created_at\":\"2026-09-01T00:00:00Z\",\"assets\":[{\"name\":\"cli-release.json\",\"browser_download_url\":\"http://127.0.0.1:8000/cli-release.json\"}]}]" > /feed/releases
+              ( cd /feed && python3 -m http.server 8000 >/dev/null 2>&1 & )
+              sleep 1
+              curl -sSf http://127.0.0.1:8000/releases > /dev/null
+
+              sh /repo/install.sh > /tmp/install.log 2>&1 || { cat /tmp/install.log; exit 1; }
+
+              export HUITZO_RELEASE_URL=http://127.0.0.1:8000/releases
               rc=0
               "$HUITZO_HOME/bin/huitzo" --version > /tmp/run.log 2>&1 || rc=$?
               cat /tmp/run.log
               echo "exit code: $rc"
 
               [ "$rc" -eq 78 ] || { echo "::error::expected EX_CONFIG (78), got $rc"; exit 1; }
-              # The message has to name the interpreter AND what the feed does
-              # carry — "no wheel" on its own is not actionable.
-              grep -q "Interpreter:   Python 3.11" /tmp/run.log
-              grep -q "linux-x86_64-cp312" /tmp/run.log
-              grep -q "linux-x86_64-cp313" /tmp/run.log
-              # And #B4 itself: nothing may have been installed into the venv.
-              # The venv must exist — the failure happened at the wheel, after
-              # the environment was built — so "no venv" is not a pass either.
-              [ -x "$HUITZO_HOME/venv/bin/python" ] || {
-                echo "::error::no managed venv at $HUITZO_HOME/venv — cannot prove the stub is absent"; exit 1; }
-              if "$HUITZO_HOME/venv/bin/python" -m pip show huitzo > /tmp/pip.log 2>&1; then
-                echo "::error::a huitzo package was installed despite the failure — the stub is back"
-                cat /tmp/pip.log
-                exit 1
+              # The message names the interpreter the launcher WOULD have
+              # provisioned and what the feed does carry - "no wheel" alone is
+              # not actionable.
+              grep -q "Skipping Python 3.12 at /usr/bin/python3.12" /tmp/run.log
+              grep -qE "Interpreter:   Python 3\.1[0-9]" /tmp/run.log
+              grep -q "linux-x86_64-cp311" /tmp/run.log
+              # Nothing downloaded: the refusal is before the CPython fetch.
+              if [ -d "$HUITZO_HOME/python" ]; then
+                echo "::error::a CPython was downloaded before the feed was asked"; exit 1
               fi
-              cat /tmp/pip.log
-              grep -q "not found: huitzo" /tmp/pip.log
+              # And the #B4 guard itself.
+              sh /repo/scripts/assert_install_outcome.sh absent
+            '
+
+      # ---- B4 guard (b): provisioning is impossible -------------------------
+      # `--network none` on a host with no Python: the launcher cannot reuse an
+      # interpreter and cannot fetch one either. It must say so and install
+      # nothing. install.sh is not used here because the container cannot reach
+      # a package mirror to get curl; the launcher binary is run directly, which
+      # is the component whose refusal is under test.
+      - name: 'B4 guard — no network and no Python refuses and installs nothing'
+        run: |
+          set -euo pipefail
+          docker run --rm --network none \
+            -v "$RUNNER_TEMP/asset:/asset:ro" -v "$PWD:/repo:ro" \
+            -e HUITZO_HOME=/tmp/huitzo-home \
+            -e HUITZO_NO_MODIFY_PATH=1 -e HUITZO_ASSUME_YES=1 \
+            -e "ASSET=$ASSET" \
+            ubuntu:22.04 bash -c '
+              set -eu
+              if command -v python3 >/dev/null; then
+                echo "::error::this image was supposed to have no python3"; exit 1
+              fi
+              rc=0
+              "/asset/$ASSET" --version > /tmp/run.log 2>&1 || rc=$?
+              cat /tmp/run.log
+              echo "exit code: $rc"
+
+              [ "$rc" -ne 0 ] || { echo "::error::an install with no network must not succeed"; exit 1; }
+              # The cause is named, and named honestly: uv could not be fetched.
+              grep -q "Could not set up uv" /tmp/run.log
+              grep -q "Network error" /tmp/run.log
+              grep -q "Nothing was installed" /tmp/run.log
+              # No downstream lie: a network failure must not be reported as
+              # a missing or unusable host Python.
+              if grep -q "No usable Python" /tmp/run.log; then
+                echo "::error::a network failure was reported as a missing Python"; exit 1
+              fi
+              sh /repo/scripts/assert_install_outcome.sh absent
             '
 
       # ---- B9 / D8: musl is refused before anything is written --------------
@@ -270,6 +383,8 @@ jobs:
           ./install.sh
           "$HUITZO_HOME/bin/huitzo" --version | tee "$RUNNER_TEMP/version.txt"
           grep -qE '^huitzo-cli [0-9]+\.[0-9]+' "$RUNNER_TEMP/version.txt"
+          # ... and it is the feed's wheel, not the 0.2.0 PyPI placeholder (#B4).
+          ./scripts/assert_install_outcome.sh installed "$RUNNER_TEMP/version.txt"
 
       - name: Remove the scratch home
         if: always()
@@ -339,6 +454,31 @@ jobs:
           if ($version -notmatch 'huitzo-cli \d+\.\d+') {
             Write-Host "::error::no huitzo-cli version line in the output above"; exit 1
           }
+          # The #B4 invariant, the PowerShell half of
+          # scripts/assert_install_outcome.sh: what landed is the feed's wheel,
+          # never the 0.2.0 PyPI placeholder.
+          $cliVersion = ([regex]::Match($version, 'huitzo-cli (\d+\.\d+\.\S+)')).Groups[1].Value
+          if ($cliVersion -eq '0.2.0') { Write-Host "::error::the 0.2.0 PyPI placeholder is back"; exit 1 }
+          $manifestPath = Join-Path $env:HUITZO_HOME 'manifest.json'
+          if (-not (Test-Path $manifestPath)) { Write-Host "::error::no manifest at $manifestPath"; exit 1 }
+          $manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
+          Write-Host "manifest: install_source=$($manifest.install_source) wheel_platform=$($manifest.wheel_platform) huitzo_version=$($manifest.huitzo_version)"
+          if ($manifest.install_source -ne 'github_release') {
+            Write-Host "::error::install_source is $($manifest.install_source), not github_release"; exit 1
+          }
+          if ($manifest.wheel_platform -notmatch '^[a-z0-9_-]+-cp3\d+$') {
+            Write-Host "::error::wheel_platform does not name an ABI-keyed feed wheel: $($manifest.wheel_platform)"; exit 1
+          }
+          if ($manifest.huitzo_version -ne $cliVersion) {
+            Write-Host "::error::manifest records $($manifest.huitzo_version) but the CLI reports $cliVersion"; exit 1
+          }
+          $pip = & (Join-Path $env:HUITZO_HOME 'venv\Scripts\python.exe') -m pip show huitzo 2>&1 | Out-String
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::pip show huitzo found nothing in the managed venv"; Write-Host $pip; exit 1 }
+          if ($pip -notmatch "(?m)^Version: $([regex]::Escape($cliVersion))$") {
+            Write-Host "::error::pip reports a different version than the CLI ($cliVersion)"; Write-Host $pip; exit 1
+          }
+          if ($pip -match 'MOVED') { Write-Host "::error::the installed distribution is the MOVED PyPI placeholder"; Write-Host $pip; exit 1 }
+          Write-Host "confirmed: huitzo $cliVersion, installed from a github_release wheel, not the 0.2.0 stub"
           exit 0
 
       # B7: the launcher used to look for `python.exe` and give up when a host
@@ -391,6 +531,31 @@ jobs:
           if ($version -notmatch 'huitzo-cli \d+\.\d+') {
             Write-Host "::error::no huitzo-cli version line in the output above"; exit 1
           }
+          # The #B4 invariant, the PowerShell half of
+          # scripts/assert_install_outcome.sh: what landed is the feed's wheel,
+          # never the 0.2.0 PyPI placeholder.
+          $cliVersion = ([regex]::Match($version, 'huitzo-cli (\d+\.\d+\.\S+)')).Groups[1].Value
+          if ($cliVersion -eq '0.2.0') { Write-Host "::error::the 0.2.0 PyPI placeholder is back"; exit 1 }
+          $manifestPath = Join-Path $env:HUITZO_HOME 'manifest.json'
+          if (-not (Test-Path $manifestPath)) { Write-Host "::error::no manifest at $manifestPath"; exit 1 }
+          $manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
+          Write-Host "manifest: install_source=$($manifest.install_source) wheel_platform=$($manifest.wheel_platform) huitzo_version=$($manifest.huitzo_version)"
+          if ($manifest.install_source -ne 'github_release') {
+            Write-Host "::error::install_source is $($manifest.install_source), not github_release"; exit 1
+          }
+          if ($manifest.wheel_platform -notmatch '^[a-z0-9_-]+-cp3\d+$') {
+            Write-Host "::error::wheel_platform does not name an ABI-keyed feed wheel: $($manifest.wheel_platform)"; exit 1
+          }
+          if ($manifest.huitzo_version -ne $cliVersion) {
+            Write-Host "::error::manifest records $($manifest.huitzo_version) but the CLI reports $cliVersion"; exit 1
+          }
+          $pip = & (Join-Path $env:HUITZO_HOME 'venv\Scripts\python.exe') -m pip show huitzo 2>&1 | Out-String
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::pip show huitzo found nothing in the managed venv"; Write-Host $pip; exit 1 }
+          if ($pip -notmatch "(?m)^Version: $([regex]::Escape($cliVersion))$") {
+            Write-Host "::error::pip reports a different version than the CLI ($cliVersion)"; Write-Host $pip; exit 1
+          }
+          if ($pip -match 'MOVED') { Write-Host "::error::the installed distribution is the MOVED PyPI placeholder"; Write-Host $pip; exit 1 }
+          Write-Host "confirmed: huitzo $cliVersion, installed from a github_release wheel, not the 0.2.0 stub"
           exit 0
 
       - name: Remove the scratch homes
