@@ -456,10 +456,9 @@ fn pending_launcher_update() -> Option<String> {
 /// Bootstrap: discover Python, create venv, install huitzo, write manifest.
 ///
 /// Fetches the release feed once upfront — fatally, since the feed is now the
-/// only source of the CLI — then iterates all discovered Python 3.11+
-/// interpreters, preferring one that has a compiled wheel in that feed. This
-/// avoids committing to Python 3.14 (for example) when only cp312/cp313 wheels
-/// exist and Python 3.12 is also available.
+/// only source of the CLI — then builds the managed venv on an interpreter the
+/// feed can actually serve a wheel to, provisioning one when the host has none
+/// (see `create_managed_venv`).
 ///
 /// Every exit from here is either a working, *verified* CLI or a named cause.
 /// There is no third outcome: the PyPI fallback that used to sit under both
@@ -551,10 +550,17 @@ fn bootstrap() -> Result<(), Error> {
 /// Build the managed venv, and report the interpreter it ended up running on.
 ///
 /// Order of attempts:
-///   1. Interpreters already on the host, wheel-compatible ones first
-///      (`python::prefer_wheel_compatible`) — reusing one saves a ~25 MB
+///   1. Interpreters already on the host **that the feed publishes a wheel
+///      for** (`python::partition_by_wheel`) — reusing one saves a ~25 MB
 ///      CPython download and is the common case.
 ///   2. Failing that, `uv python install` provisions a pinned CPython.
+///
+/// "Wheel-compatible", not merely "3.11+", is the whole of T14. The feed ships
+/// cp312/cp313; a host whose only Python is 3.11 — Debian 12 stock, i.e. the
+/// current Debian stable — used to get a 3.11 venv built on it and *then* be
+/// told no wheel matched (exit 78), while a host with no Python at all was
+/// rescued by step 2. Both now take step 2. An interpreter that cannot take a
+/// wheel is not a candidate, so it is reported and skipped rather than tried.
 ///
 /// Every attempt goes through `uv venv`, which writes the environment itself
 /// instead of shelling `python -m venv`; that is what makes a stock
@@ -566,21 +572,37 @@ fn create_managed_venv(
     let has_wheel = |v: (u8, u8)| download::has_wheel_for(release, v);
 
     let candidates = python::discover_all();
+    let (installable, no_wheel) = python::partition_by_wheel(&candidates, has_wheel);
     let mut searched: Vec<String> = Vec::new();
 
-    for py in python::prefer_wheel_compatible(&candidates, has_wheel) {
-        let wheel_note = if has_wheel(py.version) {
-            " (has compiled wheel)"
-        } else {
-            ""
-        };
+    // Named, not silently dropped: a user who has just installed a Python and
+    // still sees a download deserves to read why it was not used.
+    for py in &no_wheel {
         eprintln!(
-            "  Trying Python {}.{} at {} [{}]{}",
+            "  Skipping Python {}.{} at {} [{}] — cli-v{} publishes no wheel for it",
             py.version.0,
             py.version.1,
             py.path.display(),
             py.source.label(),
-            wheel_note
+            release.version
+        );
+        searched.push(format!(
+            "{} — Python {}.{}, via {} (no wheel in cli-v{})",
+            py.path.display(),
+            py.version.0,
+            py.version.1,
+            py.source.label(),
+            release.version
+        ));
+    }
+
+    for py in installable {
+        eprintln!(
+            "  Trying Python {}.{} at {} [{}] (has compiled wheel)",
+            py.version.0,
+            py.version.1,
+            py.path.display(),
+            py.source.label()
         );
         searched.push(format!(
             "{} — Python {}.{}, via {}",
@@ -601,11 +623,21 @@ fn create_managed_venv(
         }
     }
 
-    // Nothing on this host worked (or there was nothing here at all) — the
-    // launcher supplies its own interpreter rather than telling the user to go
-    // install one (D1).
+    // Nothing on this host can be served a wheel (or nothing here worked at
+    // all) — the launcher supplies its own interpreter rather than telling the
+    // user to go install one (D1, T14).
+    //
+    // Before spending a ~25 MB download, check the feed serves the interpreter
+    // we would provision. If it does not, provisioning cannot rescue this host
+    // and `Error::NoWheel` is the honest answer — raised here, with nothing
+    // downloaded, instead of after.
+    if let Some(provisioned) = provisioned_python_version() {
+        download::find_platform_wheel(release, Some(provisioned))?;
+    }
+
     eprintln!(
-        "  No usable system Python — downloading CPython {} with uv...",
+        "  No system Python can install a cli-v{} wheel — downloading CPython {} with uv...",
+        release.version,
         uv::PROVISIONED_PYTHON
     );
     if let Err(provision) = uv::install_python(uv_bin, uv::PROVISIONED_PYTHON) {
@@ -618,6 +650,16 @@ fn create_managed_venv(
     venv::destroy()?;
     venv::create(uv_bin, std::ffi::OsStr::new(uv::PROVISIONED_PYTHON))?;
     venv_python_info(uv::PROVISIONED_PYTHON, python::Source::UvManaged)
+}
+
+/// `uv::PROVISIONED_PYTHON` as a `(major, minor)` tuple.
+///
+/// A parse of a crate constant, so it cannot fail for a user; the unit test
+/// below pins that. It yields `None` rather than panicking anyway — a malformed
+/// pin must not abort the launcher, and skipping the pre-flight feed check only
+/// costs the download that the install step would then refuse honestly.
+fn provisioned_python_version() -> Option<(u8, u8)> {
+    parse_python_version(uv::PROVISIONED_PYTHON)
 }
 
 /// Describe the interpreter the freshly created managed venv actually runs on.
@@ -858,6 +900,110 @@ mod tests {
             filename: filename.to_string(),
             sha256: "0".repeat(64),
         }
+    }
+
+    fn release(keys: &[&str]) -> download::CliRelease {
+        download::CliRelease {
+            version: "0.11.1".to_string(),
+            min_launcher_version: "0.1.0".to_string(),
+            wheels: keys
+                .iter()
+                .map(|k| wheel(k, &format!("huitzo_cli-0.11.1-{k}.whl")))
+                .collect(),
+        }
+    }
+
+    fn found(version: (u8, u8), path: &str) -> python::PythonInfo {
+        python::PythonInfo {
+            path: std::path::PathBuf::from(path),
+            version,
+            source: python::Source::Path,
+        }
+    }
+
+    /// The live feed's shape, keyed to whatever platform the test host is.
+    fn live_feed_keys() -> Vec<String> {
+        let platform = download::current_platform().expect("tests run on a supported host");
+        vec![format!("{platform}-cp312"), format!("{platform}-cp313")]
+    }
+
+    fn live_release() -> download::CliRelease {
+        let keys = live_feed_keys();
+        release(&keys.iter().map(String::as_str).collect::<Vec<_>>())
+    }
+
+    // --- T14: a host with only a non-wheel Python must provision -----------
+
+    #[test]
+    fn a_python_the_feed_cannot_serve_is_not_a_venv_candidate() {
+        // Debian 12 stock (`python3` == 3.11.2) and Ubuntu 22.04 +
+        // `python3.11`. Before T14 `prefer_wheel_compatible` handed this
+        // interpreter back as the last-ranked candidate, `create_managed_venv`
+        // built a 3.11 venv on it, and bootstrap then died with
+        // `Error::NoWheel` (exit 78) *without ever attempting provisioning* —
+        // while a container with no Python at all was rescued. Asserting the
+        // installable group is empty is what forces the fall-through to
+        // `uv python install`; the old behaviour returned it non-empty.
+        let rel = live_release();
+        let candidates = vec![found((3, 11), "/usr/bin/python3")];
+        let (installable, skipped) =
+            python::partition_by_wheel(&candidates, |v| download::has_wheel_for(&rel, v));
+
+        assert!(
+            installable.is_empty(),
+            "3.11 has no cp311 wheel in the feed, so it cannot build the venv"
+        );
+        assert_eq!(skipped.len(), 1);
+    }
+
+    #[test]
+    fn a_wheel_compatible_system_python_is_used_and_nothing_is_downloaded() {
+        // The no-regression half: 3.12 is present, so it is selected and the
+        // provisioning branch is never reached.
+        let rel = live_release();
+        let candidates = vec![
+            found((3, 11), "/usr/bin/python3.11"),
+            found((3, 12), "/usr/bin/python3.12"),
+        ];
+        let (installable, _) =
+            python::partition_by_wheel(&candidates, |v| download::has_wheel_for(&rel, v));
+
+        assert_eq!(installable.len(), 1);
+        assert_eq!(installable[0].version, (3, 12));
+    }
+
+    #[test]
+    fn the_interpreter_the_launcher_provisions_is_one_the_live_feed_serves() {
+        // The fall-through is only a rescue if the pinned CPython can actually
+        // take a wheel. If `uv::PROVISIONED_PYTHON` ever drifts off the feed's
+        // published ABIs, every host without a system 3.12/3.13 downloads
+        // ~25 MB and then fails — so pin the pin.
+        let provisioned = provisioned_python_version().expect("PROVISIONED_PYTHON is major.minor");
+        assert!(
+            download::has_wheel_for(&live_release(), provisioned),
+            "uv::PROVISIONED_PYTHON = {} is not in the feed's cp312/cp313 set",
+            uv::PROVISIONED_PYTHON
+        );
+    }
+
+    #[test]
+    fn a_feed_that_cannot_serve_the_provisioned_python_fails_before_downloading_it() {
+        // Provisioning must still be able to fail honestly. When the feed has
+        // no wheel for the version the launcher would install, the pre-flight
+        // check in `create_managed_venv` raises the feed's own `NoWheel`
+        // instead of spending a CPython download to reach the same answer.
+        let platform = download::current_platform().unwrap();
+        let rel = release(&[&format!("{platform}-cp314")]);
+        let provisioned = provisioned_python_version().unwrap();
+
+        let e = download::find_platform_wheel(&rel, Some(provisioned)).unwrap_err();
+        let msg = e.to_string();
+        assert!(matches!(e, Error::NoWheel { .. }), "{msg}");
+        // And the message must not send the reader off to install a Python —
+        // the launcher already tried to supply one (T14).
+        assert!(!msg.contains("Install one of those"), "{msg}");
+        assert!(msg.contains("is not the fix"), "{msg}");
+        assert!(msg.contains(uv::PROVISIONED_PYTHON), "{msg}");
     }
 
     #[test]

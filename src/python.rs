@@ -258,21 +258,28 @@ pub fn parse_reg_executable_paths(stdout: &str) -> Vec<PathBuf> {
     paths
 }
 
-/// Order candidates for venv selection: interpreters that have a compiled wheel
-/// in the release feed first, everything else after, discovery order preserved
-/// inside each group.
+/// Split discovered interpreters into the ones the release feed can serve a
+/// wheel to and the ones it cannot, discovery order preserved inside each group.
 ///
-/// A stable partition rather than a sort — discovery order already encodes the
-/// host's own preference (newest named interpreter first, then `PATH` order),
-/// and the only thing that should override it is "this version can actually be
-/// served a wheel".
-pub fn prefer_wheel_compatible(
+/// This is a *filter*, not a ranking (T14). The CLI ships only as a compiled
+/// wheel, so building the managed venv on an interpreter with no matching wheel
+/// produces an environment the install step must immediately refuse. Ranking
+/// them second — the previous behaviour — is what made Debian 12 worse off than
+/// a bare container: its stock Python 3.11 was picked up, a 3.11 venv was built
+/// on it, and only then did the launcher declare the host unserviceable, while
+/// a host with *no* Python at all was rescued by provisioning one. The caller
+/// now builds only on the first group and provisions when it is empty.
+///
+/// The second group is returned so the caller can report what it skipped and
+/// why — never so it can fall back to it.
+///
+/// A stable partition rather than a sort: discovery order already encodes the
+/// host's own preference (newest named interpreter first, then `PATH` order).
+pub fn partition_by_wheel(
     candidates: &[PythonInfo],
     has_wheel: impl Fn((u8, u8)) -> bool,
-) -> Vec<&PythonInfo> {
-    let (with_wheel, without): (Vec<_>, Vec<_>) =
-        candidates.iter().partition(|py| has_wheel(py.version));
-    with_wheel.into_iter().chain(without).collect()
+) -> (Vec<&PythonInfo>, Vec<&PythonInfo>) {
+    candidates.iter().partition(|py| has_wheel(py.version))
 }
 
 /// Run the interpreter to extract its version.
@@ -331,41 +338,82 @@ mod tests {
         assert!(!meets_minimum((2, 11)), "2.11 is below 3.11");
     }
 
+    /// The live feed publishes cp312 and cp313 only.
+    fn live_feed(v: (u8, u8)) -> bool {
+        v == (3, 12) || v == (3, 13)
+    }
+
     #[test]
-    fn wheel_compatible_interpreters_are_preferred_but_others_are_kept() {
+    fn only_wheel_compatible_interpreters_are_offered_for_the_venv() {
         let candidates = vec![
             info((3, 14), "/usr/bin/python3.14"),
             info((3, 13), "/usr/bin/python3.13"),
             info((3, 12), "/usr/bin/python3.12"),
             info((3, 11), "/usr/bin/python3.11"),
         ];
-        // The live feed publishes cp312 and cp313 only.
-        let ordered = prefer_wheel_compatible(&candidates, |v| v == (3, 12) || v == (3, 13));
-        let order: Vec<_> = ordered.iter().map(|p| p.version).collect();
-        assert_eq!(order, vec![(3, 13), (3, 12), (3, 14), (3, 11)]);
+        let (installable, skipped) = partition_by_wheel(&candidates, live_feed);
+        assert_eq!(
+            installable.iter().map(|p| p.version).collect::<Vec<_>>(),
+            vec![(3, 13), (3, 12)]
+        );
+        // 3.14 and 3.11 are reported, not ranked last and then used: a venv on
+        // either of them can only ever reach `Error::NoWheel`.
+        assert_eq!(
+            skipped.iter().map(|p| p.version).collect::<Vec<_>>(),
+            vec![(3, 14), (3, 11)]
+        );
     }
 
     #[test]
-    fn preference_order_is_stable_within_each_group() {
-        // No wheels at all: the discovery order must survive untouched, so a
-        // release-feed outage cannot reshuffle which interpreter is tried.
+    fn a_debian_12_host_offers_nothing_and_must_therefore_provision() {
+        // Debian 12 stock: `python3` is 3.11.2 and nothing else is present.
+        // This is the T14 defect. The old `prefer_wheel_compatible` returned
+        // this interpreter as the (only, last-ranked) candidate, the caller
+        // built a 3.11 venv on it, and the install step then failed with
+        // exit 78 — on a host a bare container would have been rescued from.
+        let candidates = vec![info((3, 11), "/usr/bin/python3")];
+        let (installable, skipped) = partition_by_wheel(&candidates, live_feed);
+        assert!(
+            installable.is_empty(),
+            "a 3.11-only host has nothing to build on; the caller must provision"
+        );
+        assert_eq!(skipped.len(), 1, "and it must still be able to say why");
+    }
+
+    #[test]
+    fn a_host_with_a_wheel_compatible_python_does_not_need_provisioning() {
+        // The other half of the same decision: 3.12 is present, so the caller
+        // reuses it and must NOT download a second interpreter.
+        let candidates = vec![
+            info((3, 11), "/usr/bin/python3.11"),
+            info((3, 12), "/usr/bin/python3.12"),
+        ];
+        let (installable, _) = partition_by_wheel(&candidates, live_feed);
+        assert_eq!(installable.len(), 1);
+        assert_eq!(installable[0].path, PathBuf::from("/usr/bin/python3.12"));
+    }
+
+    #[test]
+    fn discovery_order_is_stable_within_each_group() {
+        // A release-feed outage (no wheels at all) must not reshuffle anything;
+        // it empties the installable group and preserves the rest verbatim.
         let candidates = vec![
             info((3, 13), "/opt/first/python3.13"),
             info((3, 13), "/usr/bin/python3.13"),
             info((3, 12), "/usr/bin/python3.12"),
         ];
-        let ordered = prefer_wheel_compatible(&candidates, |_| false);
-        let order: Vec<_> = ordered.iter().map(|p| p.path.clone()).collect();
+        let (installable, skipped) = partition_by_wheel(&candidates, |_| false);
+        assert!(installable.is_empty());
         assert_eq!(
-            order,
+            skipped.iter().map(|p| p.path.clone()).collect::<Vec<_>>(),
             vec![
                 PathBuf::from("/opt/first/python3.13"),
                 PathBuf::from("/usr/bin/python3.13"),
                 PathBuf::from("/usr/bin/python3.12"),
             ]
         );
-        // And every candidate is still offered — preference must never drop one.
-        assert_eq!(ordered.len(), candidates.len());
+        // Every candidate is still accounted for — the split must never drop one.
+        assert_eq!(installable.len() + skipped.len(), candidates.len());
     }
 
     #[test]
