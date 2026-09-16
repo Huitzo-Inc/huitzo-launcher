@@ -1,12 +1,28 @@
 // Copyright (c) 2026 Huitzo Inc. All rights reserved.
 // SPDX-License-Identifier: LicenseRef-Huitzo-Source-Available
 
-//! Bundle the pinned `uv` build tool for the Studio runner (huitzo#965 / task #38).
+//! The pinned `uv` staged at `<huitzo_home>/bin/uv`. It has TWO roles with TWO
+//! different failure modes, and conflating them is how a user ends up reading
+//! "no Python" when the real cause was a failed uv download.
 //!
-//! A launcher-only, non-technical user has no `uv`. The runner needs it to build a pack
-//! (the VALIDATE-stage gates run `uv run`; the BUILD stage runs `uv build`). This module
-//! stages a pinned, sha256-verified `uv` at `<huitzo_home>/bin/uv` and is idempotent
-//! across launches.
+//! ROLE 1 — Python environment manager for first run. FATAL. Since D1 the launcher no
+//! longer requires a system Python: `uv venv` builds the managed venv (it writes the
+//! environment itself instead of shelling `python -m venv`, so a distro that splits out
+//! `ensurepip` still works — #B3), and `uv python install` provisions a pinned CPython
+//! when the host has nothing usable at all (#B2). `bootstrap` therefore goes through
+//! `ensure_uv_required`, which stages uv BEFORE anything Python-shaped is attempted and
+//! turns any failure — unsupported platform, failed fetch, or a success that staged
+//! nothing — into `Error::UvUnavailable`. First run cannot proceed without uv.
+//!
+//! ROLE 2 — build tool for the Studio runner (huitzo#965 / task #38). NON-FATAL. A
+//! launcher-only, non-technical user has no `uv`; the runner needs it to build a pack
+//! (the VALIDATE-stage gates run `uv run`; the BUILD stage runs `uv build`). Those call
+//! sites — `main.rs` step 7.5 and `run_local` — call `ensure_uv` directly, log a warning
+//! and continue; a runner without uv reports the honest `build_tools_missing` in Studio.
+//!
+//! So `ensure_uv` is the non-fatal primitive: idempotent across launches, and silently
+//! `Ok(())` on a platform with no pinned asset. It is `ensure_uv_required` that names uv
+//! as the cause and fails the run.
 //!
 //! SECURITY (Security-PRIMARY review surface): the archive is verified against the
 //! compiled-in sha256 (`uv_manifest`, the trust anchor) BEFORE it is extracted or made
@@ -14,9 +30,6 @@
 //! staged). Only the entry named exactly `uv` (`uv.exe` on Windows) is extracted, and
 //! its bytes are streamed to a launcher-controlled destination path — the archive's own
 //! internal paths never decide where anything lands (no path traversal).
-//!
-//! NON-FATAL: a failure here never bricks the launcher. The caller logs a warning and
-//! continues; a runner without uv reports the honest `build_tools_missing` in Studio.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
