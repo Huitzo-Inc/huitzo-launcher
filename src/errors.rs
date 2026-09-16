@@ -20,6 +20,28 @@ fn indent(detail: &str) -> String {
         .join("\n")
 }
 
+/// Why the CLI release feed could not be read.
+///
+/// The launcher calls `api.github.com` unauthenticated, where the allowance is
+/// 60 requests/hour per IP — routine to exhaust behind a corporate NAT or on a
+/// shared CI runner. Naming that cause separately from "the network is down"
+/// and from "the feed returned nonsense" is the whole point of this type (M11).
+pub enum FeedError {
+    /// 403/429. `remaining` is GitHub's `x-ratelimit-remaining` when present —
+    /// `Some(0)` makes the rate limit a fact rather than an inference.
+    Forbidden {
+        status: u16,
+        remaining: Option<u64>,
+        retry_after: Option<String>,
+    },
+    /// Any other non-200 status from the feed host.
+    Status(u16),
+    /// The request never completed: DNS, TCP, TLS, proxy, or timeout.
+    Unreachable(String),
+    /// The feed answered, but not with something the launcher can parse.
+    Malformed(String),
+}
+
 /// Launcher error types with user-facing messages.
 pub enum Error {
     /// No usable Python 3.11+ interpreter could be found OR provisioned.
@@ -41,6 +63,29 @@ pub enum Error {
     UvUnavailable(String),
     /// pip install failed.
     PipInstall(String),
+    /// The CLI release feed could not be read (M11).
+    ///
+    /// Distinct from [`Error::NoWheel`]: there the launcher knows exactly what
+    /// the feed offers and knows this host is not in it; here it knows nothing
+    /// at all. Collapsing the two is what let a routine GitHub rate-limit 403
+    /// install the PyPI stub on a perfectly good host.
+    FeedUnavailable { url: String, cause: FeedError },
+    /// The feed was read and carries no wheel this interpreter can install (B4).
+    ///
+    /// Terminal: the CLI ships only as a compiled wheel, so there is nothing
+    /// else to try (D5 — the PyPI fallback is gone, not flag-gated).
+    NoWheel {
+        platform: String,
+        python_version: (u8, u8),
+        feed_version: String,
+        available: Vec<String>,
+    },
+    /// A wheel installed cleanly but the environment still cannot run the CLI (M8).
+    InstallVerify {
+        wheel: String,
+        python: String,
+        detail: String,
+    },
     /// HTTP request failed (PyPI, GitHub).
     Network(String),
     /// manifest.json read/write failed.
@@ -140,6 +185,93 @@ impl fmt::Display for Error {
                 "Package installation failed.\n{detail}\n\n\
                  Check your internet connection and try: huitzo --launcher-bootstrap"
             ),
+            Error::FeedUnavailable { url, cause } => write!(
+                f,
+                "Could not read the Huitzo CLI release feed, so nothing was installed.\n\n\
+                 \x20 Feed: {url}\n\
+                 \x20 Cause: {cause}\n\n\
+                 The CLI is distributed only as a checksum-verified wheel from this feed;\n\
+                 there is no package-index fallback, so the launcher cannot guess its way\n\
+                 past an unreadable feed. Your environment is untouched — retry when the\n\
+                 feed is reachable."
+            ),
+            Error::NoWheel {
+                platform,
+                python_version,
+                feed_version,
+                available,
+            } => {
+                let (major, minor) = python_version;
+                // The subset that would work here if the user had that
+                // interpreter — the difference between "unsupported machine"
+                // and "wrong Python", which is the actionable part.
+                let prefix = format!("{platform}-cp");
+                let other_pythons: Vec<String> = available
+                    .iter()
+                    .filter_map(|k| k.strip_prefix(&prefix))
+                    .filter_map(|abi| {
+                        // `split_at_checked`, not `split_at`: a feed key of
+                        // exactly "<platform>-cp" leaves an empty ABI and the
+                        // panicking form would crash while rendering an error.
+                        let (maj, min) = abi.split_at_checked(1)?;
+                        Some(format!("{maj}.{}", min.parse::<u32>().ok()?))
+                    })
+                    .collect();
+                let available = if available.is_empty() {
+                    "    (the feed lists no wheels at all)".to_string()
+                } else {
+                    available
+                        .iter()
+                        .map(|k| format!("    {k}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                write!(
+                    f,
+                    "No Huitzo CLI wheel matches this machine, so nothing was installed.\n\n\
+                     \x20 Platform key:  {platform}\n\
+                     \x20 Interpreter:   Python {major}.{minor}\n\
+                     \x20 Release:       cli-v{feed_version}\n\
+                     \x20 Feed offers:\n{available}\n\n{}\
+                     Report a platform you expected to see at\n\
+                     https://github.com/Huitzo-Inc/huitzo-launcher/issues",
+                    if other_pythons.is_empty() {
+                        // No wheel for this platform at ANY Python version.
+                        // T5 seam: on `macos-x86_64` this is where the D2
+                        // "Apple Silicon required" refusal belongs — T5 owns
+                        // refusing before the venv is ever built, so this
+                        // generic message is the placeholder, not the answer.
+                        format!(
+                            "The CLI ships as a compiled wheel and there is no {platform} build \
+                             at any\nPython version, so no interpreter on this machine can run it.\n\n"
+                        )
+                    } else {
+                        format!(
+                            "The feed does have {platform} wheels — for Python {}.\n\
+                             Install one of those and re-run; the launcher prefers an interpreter\n\
+                             that has a wheel whenever the host has one.\n\n",
+                            other_pythons.join(", ")
+                        )
+                    }
+                )
+            }
+            Error::InstallVerify {
+                wheel,
+                python,
+                detail,
+            } => write!(
+                f,
+                "The CLI installed but the environment cannot run it.\n\n\
+                 \x20 Wheel:       {wheel}\n\
+                 \x20 Interpreter: {python}\n\
+                 \x20 `python -P -m huitzo_cli` would fail with:\n{}\n\n\
+                 The launcher checks this before reporting success, so you are seeing the\n\
+                 real failure instead of a \"success\" line followed by a broken CLI. The\n\
+                 environment is left in place for inspection. Please report the wheel name\n\
+                 and the output above at\n\
+                 https://github.com/Huitzo-Inc/huitzo-launcher/issues",
+                indent(detail)
+            ),
             Error::Network(detail) => write!(f, "Network error: {detail}"),
             Error::Manifest(detail) => write!(f, "Manifest error: {detail}"),
             Error::SelfUpdate(detail) => write!(
@@ -199,6 +331,55 @@ impl fmt::Display for Error {
     }
 }
 
+impl fmt::Display for FeedError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FeedError::Forbidden {
+                status,
+                remaining,
+                retry_after,
+            } => {
+                // `x-ratelimit-remaining: 0` turns the diagnosis from a guess
+                // into a fact; without the header a 403 is still overwhelmingly
+                // the unauthenticated allowance, so say so as a likelihood.
+                let cause = if *remaining == Some(0) {
+                    "the GitHub API rate limit for this IP is exhausted"
+                } else {
+                    "HTTP 403/429 — on api.github.com this is almost always the rate limit"
+                };
+                write!(f, "HTTP {status}: {cause}.")?;
+                if let Some(when) = retry_after {
+                    write!(f, " Allowance resets {when}.")?;
+                }
+                write!(
+                    f,
+                    "\n    Unauthenticated callers get 60 requests/hour per IP address, which a\n\
+                     \x20   shared office NAT or a busy CI runner can spend without you. Retry\n\
+                     \x20   later, or raise the allowance by exporting a token (no scopes needed,\n\
+                     \x20   public data only):\n\
+                     \x20     export GITHUB_TOKEN=ghp_…"
+                )
+            }
+            FeedError::Status(status) => write!(
+                f,
+                "HTTP {status} from the release feed — the server answered, but not with a\n\
+                 \x20   release list."
+            ),
+            FeedError::Unreachable(detail) => write!(
+                f,
+                "the request never completed: {detail}\n\
+                 \x20   A network, DNS, proxy or TLS problem rather than anything about your\n\
+                 \x20   machine's Python."
+            ),
+            FeedError::Malformed(detail) => write!(
+                f,
+                "the feed was unreadable: {detail}\n\
+                 \x20   Something answered on this URL that is not a Huitzo release feed."
+            ),
+        }
+    }
+}
+
 impl fmt::Debug for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(self, f)
@@ -213,8 +394,16 @@ pub fn exit_code(err: &Error) -> i32 {
         Error::VenvRemove(_) => 73,     // EX_CANTCREAT
         Error::UvUnavailable(_) => 69,  // EX_UNAVAILABLE — a fetch failed
         Error::PipInstall(_) => 69,     // EX_UNAVAILABLE
-        Error::Network(_) => 69,        // EX_UNAVAILABLE
-        Error::Manifest(_) => 66,       // EX_NOINPUT
+        // An infrastructure outage, not a misconfigured host (M11).
+        Error::FeedUnavailable { .. } => 69, // EX_UNAVAILABLE
+        // This machine/interpreter is not one the feed builds for (B4/B5) —
+        // a configuration fact the user can act on, distinct from a 69 outage
+        // that is worth retrying verbatim.
+        Error::NoWheel { .. } => 78, // EX_CONFIG
+        // Install succeeded, artefact is wrong: bad data from the feed (M8).
+        Error::InstallVerify { .. } => 65, // EX_DATAERR
+        Error::Network(_) => 69,           // EX_UNAVAILABLE
+        Error::Manifest(_) => 66,          // EX_NOINPUT
         Error::SelfUpdate(_) => 1,
         Error::Exec(_) => 126,              // Command found but not executable
         Error::TrustViolation { .. } => 77, // EX_NOPERM
@@ -292,6 +481,42 @@ mod tests {
             69,
             "EX_UNAVAILABLE"
         );
+    }
+
+    /// The three new install-path failures must be distinguishable by exit
+    /// code alone: a script retrying a 69 outage must not retry an 78
+    /// unsupported platform forever, and neither is a 65 bad artefact.
+    #[test]
+    fn the_install_failure_modes_have_distinct_exit_codes() {
+        let feed = Error::FeedUnavailable {
+            url: "https://api.github.com/x".to_string(),
+            cause: FeedError::Status(503),
+        };
+        let no_wheel = Error::NoWheel {
+            platform: "linux-x86_64".to_string(),
+            python_version: (3, 11),
+            feed_version: "0.11.1".to_string(),
+            available: vec!["linux-x86_64-cp312".to_string()],
+        };
+        let broken = Error::InstallVerify {
+            wheel: "w.whl".to_string(),
+            python: "/venv/python".to_string(),
+            detail: "boom".to_string(),
+        };
+        assert_eq!(exit_code(&feed), 69, "EX_UNAVAILABLE — retryable outage");
+        assert_eq!(
+            exit_code(&no_wheel),
+            78,
+            "EX_CONFIG — this host, not a blip"
+        );
+        assert_eq!(exit_code(&broken), 65, "EX_DATAERR — the artefact is wrong");
+        for e in [&feed, &no_wheel, &broken] {
+            let msg = e.to_string();
+            assert_no_stale_remedy(&msg);
+            // #B4 is closed: no install-path message may point at a package index.
+            assert!(!msg.contains("PyPI"), "{msg}");
+            assert!(!msg.contains("pip install"), "{msg}");
+        }
     }
 
     #[test]
