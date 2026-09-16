@@ -6,7 +6,7 @@ Native launcher for the [Huitzo CLI](https://huitzo.ai). Manages a Python virtua
 
 The launcher is a lightweight Rust binary (~3-5 MB) that:
 
-1. **Discovers** Python 3.11+ on your system
+1. **Selects** a Python the published CLI wheels support -- reusing one already on your system, or downloading a managed CPython when none matches. You do not need to install Python yourself.
 2. **Creates** a managed virtual environment at `~/.huitzo/venv/`
 3. **Installs** the `huitzo` CLI (compiled wheel from GitHub Releases)
 4. **Checks** for updates in the background (non-blocking)

@@ -97,6 +97,13 @@ pub enum Error {
     ///
     /// Terminal: the CLI ships only as a compiled wheel, so there is nothing
     /// else to try (D5 — the PyPI fallback is gone, not flag-gated).
+    ///
+    /// Since T14 this is no longer something the user can fix by installing a
+    /// Python. `create_managed_venv` provisions a wheel-compatible CPython
+    /// whenever the host has none, so on the bootstrap path this error now only
+    /// means the feed does not serve the version the launcher would provision
+    /// either — a launcher/feed drift, not a missing system interpreter. The
+    /// message must not send the reader off to install one.
     NoWheel {
         platform: String,
         /// The interpreter the wheel was being chosen for, when one is known.
@@ -364,8 +371,11 @@ impl fmt::Display for Error {
                     } else {
                         format!(
                             "The feed does have {platform} wheels — for Python {}.\n\
-                             Install one of those and re-run; the launcher prefers an interpreter\n\
-                             that has a wheel whenever the host has one.\n\n",
+                             Installing one of those by hand is not the fix: the launcher supplies\n\
+                             its own CPython {PROVISIONED_PYTHON} whenever no interpreter on the host\n\
+                             can take a wheel. So either this feed dropped the build this\n\
+                             environment was made for, or it no longer publishes the version the\n\
+                             launcher is pinned to. Try `huitzo --launcher-update` first.\n\n",
                             other_pythons.join(", ")
                         )
                     }
