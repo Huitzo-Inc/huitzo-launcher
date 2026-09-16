@@ -624,7 +624,7 @@ fn is_executable_file(md: std::fs::Metadata) -> bool {
 /// Read from the venv's own `pyvenv.cfg` (`version` as written by the stdlib
 /// `venv`, `version_info` as written by `uv`) — one small file read, no
 /// process spawn. Unknown means `false`: the managed venv is guaranteed 3.11+
-/// by `python::discover_all`, but a locally detected interpreter is not ours,
+/// by bootstrap, but a locally detected interpreter is not ours,
 /// and passing `-P` to Python 3.10 is a hard startup error ("Unknown option:
 /// -P") that would break the very workflow this module exists to fix.
 fn venv_supports_safe_path(venv_root: &Path) -> bool {

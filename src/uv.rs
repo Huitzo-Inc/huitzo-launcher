@@ -1,12 +1,28 @@
 // Copyright (c) 2026 Huitzo Inc. All rights reserved.
 // SPDX-License-Identifier: LicenseRef-Huitzo-Source-Available
 
-//! Bundle the pinned `uv` build tool for the Studio runner (huitzo#965 / task #38).
+//! The pinned `uv` staged at `<huitzo_home>/bin/uv`. It has TWO roles with TWO
+//! different failure modes, and conflating them is how a user ends up reading
+//! "no Python" when the real cause was a failed uv download.
 //!
-//! A launcher-only, non-technical user has no `uv`. The runner needs it to build a pack
-//! (the VALIDATE-stage gates run `uv run`; the BUILD stage runs `uv build`). This module
-//! stages a pinned, sha256-verified `uv` at `<huitzo_home>/bin/uv` and is idempotent
-//! across launches.
+//! ROLE 1 — Python environment manager for first run. FATAL. Since D1 the launcher no
+//! longer requires a system Python: `uv venv` builds the managed venv (it writes the
+//! environment itself instead of shelling `python -m venv`, so a distro that splits out
+//! `ensurepip` still works — #B3), and `uv python install` provisions a pinned CPython
+//! when the host has nothing usable at all (#B2). `bootstrap` therefore goes through
+//! `ensure_uv_required`, which stages uv BEFORE anything Python-shaped is attempted and
+//! turns any failure — unsupported platform, failed fetch, or a success that staged
+//! nothing — into `Error::UvUnavailable`. First run cannot proceed without uv.
+//!
+//! ROLE 2 — build tool for the Studio runner (huitzo#965 / task #38). NON-FATAL. A
+//! launcher-only, non-technical user has no `uv`; the runner needs it to build a pack
+//! (the VALIDATE-stage gates run `uv run`; the BUILD stage runs `uv build`). Those call
+//! sites — `main.rs` step 7.5 and `run_local` — call `ensure_uv` directly, log a warning
+//! and continue; a runner without uv reports the honest `build_tools_missing` in Studio.
+//!
+//! So `ensure_uv` is the non-fatal primitive: idempotent across launches, and silently
+//! `Ok(())` on a platform with no pinned asset. It is `ensure_uv_required` that names uv
+//! as the cause and fails the run.
 //!
 //! SECURITY (Security-PRIMARY review surface): the archive is verified against the
 //! compiled-in sha256 (`uv_manifest`, the trust anchor) BEFORE it is extracted or made
@@ -14,17 +30,23 @@
 //! staged). Only the entry named exactly `uv` (`uv.exe` on Windows) is extracted, and
 //! its bytes are streamed to a launcher-controlled destination path — the archive's own
 //! internal paths never decide where anything lands (no path traversal).
-//!
-//! NON-FATAL: a failure here never bricks the launcher. The caller logs a warning and
-//! continues; a runner without uv reports the honest `build_tools_missing` in Studio.
 
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use crate::dirs;
 use crate::download;
 use crate::errors::Error;
 use crate::uv_manifest::{PINNED_UV_VERSION, uv_asset_for_host, uv_download_url};
+
+/// The CPython version the launcher provisions when the host has no usable
+/// interpreter (D1).
+///
+/// MUST be a version the CLI release feed publishes a wheel for — the feed ships
+/// `cp312` and `cp313`, and 3.13 is the newer of the two, so a provisioned host
+/// lands on the same ABI the project builds for first.
+pub const PROVISIONED_PYTHON: &str = "3.13";
 
 /// Ensure the pinned `uv` is staged at `<huitzo_home>/bin/uv` (idempotent).
 ///
@@ -42,7 +64,7 @@ pub fn ensure_uv() -> Result<(), Error> {
         return Ok(());
     }
 
-    eprintln!("  Setting up uv {PINNED_UV_VERSION} (Studio build tool)...");
+    eprintln!("  Setting up uv {PINNED_UV_VERSION} (Python environment manager)...");
     let archive = dirs::huitzo_home().join("cache").join(asset.filename);
 
     // 1. Download + VERIFY the archive against the compiled-in sha256 (trust anchor).
@@ -211,6 +233,68 @@ fn make_executable(dest: &Path) -> Result<(), Error> {
 
 #[cfg(not(unix))]
 fn make_executable(_dest: &Path) -> Result<(), Error> {
+    Ok(())
+}
+
+/// A `Command` for the staged uv with the launcher's environment applied.
+///
+/// `UV_PYTHON_INSTALL_DIR` keeps provisioned interpreters inside `$HUITZO_HOME`
+/// rather than uv's user-global data dir: the managed venv symlinks its base
+/// interpreter, so that interpreter has to live somewhere the launcher owns and
+/// a sandboxed `HUITZO_HOME` fully contains.
+pub fn command(uv_bin: &Path) -> Command {
+    let mut cmd = Command::new(uv_bin);
+    cmd.env("UV_PYTHON_INSTALL_DIR", dirs::uv_python_dir());
+    cmd
+}
+
+/// Ensure uv is staged and return its path, treating failure as fatal.
+///
+/// Since D1 uv builds the managed venv and provisions CPython, so first run
+/// cannot proceed without it. `ensure_uv` degrades silently for the Studio
+/// build-tool use; this wrapper is for callers where uv IS the dependency, and
+/// it names uv as the cause rather than surfacing a later, misleading
+/// "no Python" or "venv failed".
+pub fn ensure_uv_required() -> Result<PathBuf, Error> {
+    if uv_asset_for_host().is_none() {
+        return Err(Error::UvUnavailable(format!(
+            "no pinned uv {PINNED_UV_VERSION} build exists for this platform ({}-{})",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        )));
+    }
+    ensure_uv().map_err(|e| Error::UvUnavailable(e.to_string()))?;
+
+    let dest = dirs::uv_bin();
+    if !dest.is_file() {
+        return Err(Error::UvUnavailable(format!(
+            "uv reported success but nothing was staged at {}",
+            dest.display()
+        )));
+    }
+    Ok(dest)
+}
+
+/// Provision a uv-managed CPython `version` under `$HUITZO_HOME/python`.
+///
+/// Returns the raw `uv python install` stderr on failure so the caller can put
+/// it in front of the user — "download your own Python" is never actionable
+/// advice, but "the download failed because …" is.
+pub fn install_python(uv_bin: &Path, version: &str) -> Result<(), String> {
+    let output = command(uv_bin)
+        .args(["python", "install", version])
+        .output()
+        .map_err(|e| format!("could not run {}: {e}", uv_bin.display()))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        return Err(if stderr.is_empty() {
+            format!("exited with {}", output.status)
+        } else {
+            stderr.to_string()
+        });
+    }
     Ok(())
 }
 

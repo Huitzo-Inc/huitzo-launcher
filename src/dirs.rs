@@ -48,6 +48,17 @@ pub fn uv_bin() -> PathBuf {
     bin_dir().join(name)
 }
 
+/// Returns the directory uv installs managed CPython builds into:
+/// `<huitzo_home>/python/`.
+///
+/// Passed to every uv invocation as `UV_PYTHON_INSTALL_DIR`. Keeping provisioned
+/// interpreters under `$HUITZO_HOME` means the managed venv's base interpreter
+/// lives in a tree the launcher owns, and a sandboxed `HUITZO_HOME` contains
+/// everything first run creates.
+pub fn uv_python_dir() -> PathBuf {
+    huitzo_home().join("python")
+}
+
 /// Returns the uv version-stamp file: `<huitzo_home>/uv-version.txt`.
 ///
 /// Records which pinned uv version is currently staged so a launch can short-circuit

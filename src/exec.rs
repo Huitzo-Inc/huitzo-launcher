@@ -14,8 +14,9 @@ use crate::errors::Error;
 /// the launcher (e.g., to suppress "run pip install --upgrade" messages).
 ///
 /// `safe_path` adds `-P` (Python 3.11+), keeping the invocation directory off
-/// `sys.path`. Always true for the managed venv (guaranteed 3.11+ by
-/// `python::discover_all`); for a locally detected interpreter (#53) the
+/// `sys.path`. Always true for the managed venv (bootstrap re-probes the
+/// finished environment against `python::MIN_PYTHON`); for a locally detected
+/// interpreter (#53) the
 /// caller reports what that venv's `pyvenv.cfg` says, because `-P` on an
 /// older interpreter is a hard startup error.
 pub fn exec_into_python(venv_python: &Path, args: &[String], safe_path: bool) -> Result<(), Error> {
