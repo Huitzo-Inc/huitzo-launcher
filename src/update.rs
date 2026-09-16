@@ -50,12 +50,17 @@ pub fn is_homebrew_install() -> bool {
         .is_some_and(|s| s.contains("/Cellar/") || s.contains("/homebrew/"))
 }
 
-/// Run the update check synchronously with a 5-second timeout.
+/// Run the update check synchronously, waiting at most 5 seconds for it.
 ///
-/// Spawns the check in a thread so the network call is bounded; the main thread
-/// blocks until the check completes or the timeout elapses, then proceeds to
-/// `exec_into_python`. This guarantees the manifest is written before `execvp`
-/// replaces the process (killing any detached thread).
+/// The 5 seconds bound the *user's* wait, not the request: `recv_timeout`
+/// abandons the waiter and returns, it does not cancel anything, and the
+/// spawned thread keeps running until `execvp` replaces the process. The
+/// requests are bounded separately and for real, by the timeouts
+/// [`crate::download::http_agent`] puts on every call (M12) — without those a
+/// blackholed host left that thread alive with no way to end.
+///
+/// Blocking here at all is deliberate: it guarantees the manifest is written
+/// before `execvp` kills any detached thread.
 pub fn sync_check() {
     let (tx, rx) = std::sync::mpsc::channel::<()>();
     std::thread::spawn(move || {
@@ -124,11 +129,17 @@ fn check_launcher_version() -> Option<String> {
 /// Fetch all releases from GitHub Releases API.
 fn fetch_all_releases() -> Result<serde_json::Value, Error> {
     let url = "https://api.github.com/repos/Huitzo-Inc/huitzo-launcher/releases";
-    let mut response = ureq::get(url)
+    let mut response = download::http_agent(download::FEED_BUDGET)?
+        .get(url)
         .header("Accept", "application/vnd.github+json")
         .header("User-Agent", "huitzo-launcher")
         .call()
-        .map_err(|e| Error::Network(format!("GitHub API request failed: {e}")))?;
+        .map_err(|e| {
+            Error::Network(format!(
+                "GitHub API request failed: {}",
+                download::transport_failure(&e, download::FEED_BUDGET)
+            ))
+        })?;
 
     let body = response
         .body_mut()
@@ -637,10 +648,17 @@ fn find_asset_url(assets: &[serde_json::Value], name: &str) -> Result<String, Er
 ///
 /// Expected format: `<hex_hash>  <filename>\n` or just `<hex_hash>\n`
 fn download_checksum(url: &str) -> Result<String, Error> {
-    let mut response = ureq::get(url)
+    // A checksum file is a single line, so it gets the small-request budget.
+    let mut response = download::http_agent(download::FEED_BUDGET)?
+        .get(url)
         .header("User-Agent", "huitzo-launcher")
         .call()
-        .map_err(|e| Error::Network(format!("Failed to download checksum: {e}")))?;
+        .map_err(|e| {
+            Error::Network(format!(
+                "Failed to download checksum: {}",
+                download::transport_failure(&e, download::FEED_BUDGET)
+            ))
+        })?;
 
     let body = response
         .body_mut()
@@ -667,25 +685,41 @@ fn download_checksum(url: &str) -> Result<String, Error> {
 ///
 /// Returns the hex-encoded hash of the downloaded file.
 fn download_and_hash(url: &str, dest: &std::path::Path) -> Result<String, Error> {
-    let mut response = ureq::get(url)
+    // The launcher binary is a multi-megabyte artefact: the download budget,
+    // not the feed one.
+    let mut response = download::http_agent(download::DOWNLOAD_BUDGET)?
+        .get(url)
         .header("User-Agent", "huitzo-launcher")
         .call()
-        .map_err(|e| Error::Network(format!("Failed to download binary: {e}")))?;
+        .map_err(|e| {
+            Error::Network(format!(
+                "Failed to download binary: {}",
+                download::transport_failure(&e, download::DOWNLOAD_BUDGET)
+            ))
+        })?;
 
     let mut file = std::fs::File::create(dest)
         .map_err(|e| Error::SelfUpdate(format!("Failed to create temp file: {e}")))?;
 
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 8192];
+    let mut written: u64 = 0;
     let mut reader = response.body_mut().as_reader();
 
     loop {
-        let n = reader
-            .read(&mut buf)
-            .map_err(|e| Error::Network(format!("Download interrupted: {e}")))?;
+        // Inside the same global budget as the request that opened this body,
+        // so a stalled transfer ends here instead of hanging the update.
+        let n = reader.read(&mut buf).map_err(|e| {
+            Error::Network(format!(
+                "Download of {url} interrupted after {written} bytes: {e}\n\
+                 \x20 The whole download must finish within {}s.",
+                download::DOWNLOAD_BUDGET.global_secs()
+            ))
+        })?;
         if n == 0 {
             break;
         }
+        written += n as u64;
         hasher.update(&buf[..n]);
         std::io::Write::write_all(&mut file, &buf[..n])
             .map_err(|e| Error::SelfUpdate(format!("Failed to write binary: {e}")))?;

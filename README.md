@@ -125,6 +125,23 @@ which interpreter runs. An environment you activated yourself (`VIRTUAL_ENV`,
 | `HUITZO_BOOTSTRAP_CONSENTED` | Set by `install.sh`/`install.ps1` after up-front consent so first-run bootstrap does not re-prompt |
 | `HUITZO_LAUNCHER_FORCE` | Always delegate to `~/.huitzo/venv`, skipping local-checkout detection (same as `--use-installed`) |
 | `HUITZO_NO_MODIFY_PATH` | Skip the installer's `PATH` modification (`install.sh` / `install.ps1`) |
+| `HUITZO_CA_BUNDLE` | PEM file of trust anchors to verify TLS against **instead of** the CA list compiled into the launcher. Needed behind a TLS-intercepting proxy, which the bundled list rejects by design. May hold a chain; on a managed machine the system bundle (`/etc/ssl/certs/ca-certificates.crt`) is usually the right value, since it already carries the public roots plus the corporate one. Covers the launcher's own requests; `uv` runs as a subprocess and needs `SSL_CERT_FILE` set to the same path. |
+| `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` | Proxy to route the release-feed and download requests through, e.g. `http://proxy.corp:8080`. The scheme-less form (`proxy.corp:8080`) is accepted too, as are `https://`, `socks5://` and `user:password@` (credentials are redacted out of error messages). A value that cannot be parsed is refused rather than silently bypassed. |
+| `NO_PROXY` | Comma-separated hosts to reach directly, e.g. `localhost,.internal.corp`. |
+
+**These proxy variables used to be ignored.** Earlier launcher releases never
+read them and always connected direct, so a stale value — a leftover VPN
+profile, a decommissioned corporate proxy — did no harm. It does now: the
+launcher routes through whatever they name, and an install that used to work
+will fail if that proxy is dead. Unset the variable, or name the hosts it must
+not apply to in `NO_PROXY`.
+
+Requests on the install and update path are bounded: 15 s to connect (DNS, TCP,
+proxy `CONNECT` and the TLS handshake), 30 s for response headers, and then 30 s
+for a whole feed request or 15 minutes for a whole artefact download. Nothing
+hangs indefinitely; a TLS failure names the proxy and CA settings that were in
+effect. See [docs/SUPPORT_MATRIX.md](docs/SUPPORT_MATRIX.md), "Behind a
+TLS-intercepting proxy".
 
 ## Build from Source
 

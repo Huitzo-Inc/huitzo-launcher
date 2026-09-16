@@ -176,10 +176,273 @@ fn has_glibc_loader() -> bool {
     .any(|p| std::path::Path::new(p).exists())
 }
 
-/// How long the launcher will wait on the release feed before calling it
-/// unreachable. Without a bound, a blackholed connection hangs `huitzo` forever
-/// instead of producing the error this module exists to produce.
+// --- HTTP transport: timeouts, proxy and trust anchors (M12, m15) -----------
+//
+// Every request the launcher makes on the install or update path is built
+// here, so "does this request have a timeout?" has one answer instead of one
+// per call site. Before this, only `fetch_feed` was bounded: the ~50 MB wheel
+// download and the whole of `update.rs` had no timeout at all and a blackholed
+// connection hung `huitzo` forever.
+
+/// Cap on DNS + TCP + any proxy CONNECT + the TLS handshake.
+///
+/// Sized for a slow corporate proxy chain, not for a healthy connection: 15 s
+/// is well past the ~1-3 s a real handshake takes even through a MITM proxy,
+/// and is what bounds the "socket accepts and never speaks" case, where the
+/// TCP connect succeeds and the TLS handshake is what hangs.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Cap on waiting for response *headers* after the request is sent.
+///
+/// This is server think-time, not transfer time — GitHub answers in
+/// milliseconds, so 30 s only ever fires on something that is not answering.
+const RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Cap on a whole feed request: connect, headers and a small JSON body.
+///
+/// The release list and `cli-release.json` are tens of kilobytes; nothing
+/// legitimate on this path takes 30 s.
 const FEED_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Cap on a whole artefact download: connect, headers and the body.
+///
+/// The largest artefact on the install path is the CLI wheel at roughly 50 MB
+/// (the launcher binary and the `uv` archive are smaller). 15 minutes is a
+/// floor of about 57 kB/s sustained — below a bad hotel link or a throttled
+/// mobile tether, so a genuinely slow but working connection still finishes —
+/// while still being a bound, which is the whole point: `ureq` applies no
+/// timeout by default, so the old code's only "bound" was TCP keepalive.
+///
+/// This is a total budget, not an idle one: `ureq` 3 has no configurable
+/// stall timeout, so a transfer that trickles for 15 minutes is cut off. That
+/// is the conservative direction — a hung install that never returns is worse
+/// than one that fails with a message naming the budget it blew.
+const DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(900);
+
+/// Env var naming a PEM file of trust anchors to use *instead of* the CA list
+/// compiled into the launcher.
+///
+/// Same semantics as `CURL_CA_BUNDLE` / `REQUESTS_CA_BUNDLE`: it replaces the
+/// default set rather than adding to it, so on a machine that must reach both
+/// the corporate proxy and the public internet, point it at the system bundle
+/// (which already contains the public roots plus the corporate one), e.g.
+/// `/etc/ssl/certs/ca-certificates.crt`.
+pub const CA_BUNDLE_ENV: &str = "HUITZO_CA_BUNDLE";
+
+/// Proxy env vars, in the order `ureq` itself tries them.
+const PROXY_ENV: &[&str] = &[
+    "ALL_PROXY",
+    "all_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+];
+
+/// How long a family of requests is allowed to take, and what to call it in
+/// an error message.
+#[derive(Clone, Copy)]
+pub(crate) struct Budget {
+    what: &'static str,
+    global: std::time::Duration,
+}
+
+impl Budget {
+    /// The cap on the whole call, for messages that quote it back.
+    pub(crate) fn global_secs(&self) -> u64 {
+        self.global.as_secs()
+    }
+}
+
+/// Small JSON over HTTPS: the release list, `cli-release.json`, a checksum.
+pub(crate) const FEED_BUDGET: Budget = Budget {
+    what: "release feed request",
+    global: FEED_TIMEOUT,
+};
+
+/// A whole artefact: a wheel, a launcher binary, a `uv` archive.
+pub(crate) const DOWNLOAD_BUDGET: Budget = Budget {
+    what: "download",
+    global: DOWNLOAD_TIMEOUT,
+};
+
+/// The first proxy env var that carries a value, and that value.
+fn proxy_env_value() -> Option<(&'static str, String)> {
+    PROXY_ENV.iter().find_map(|name| {
+        let value = std::env::var(name).ok()?;
+        let value = value.trim().to_string();
+        (!value.is_empty()).then_some((*name, value))
+    })
+}
+
+/// Hide any `user:password@` in a proxy URL before it reaches stderr.
+fn redact_userinfo(proxy: &str) -> String {
+    match proxy.rsplit_once('@') {
+        Some((before, host)) => {
+            let scheme = before.split_once("://").map(|(s, _)| s);
+            match scheme {
+                Some(scheme) => format!("{scheme}://***@{host}"),
+                None => format!("***@{host}"),
+            }
+        }
+        None => proxy.to_string(),
+    }
+}
+
+/// The proxy to route through, from the environment.
+///
+/// `ureq` reads these variables itself when its `Config` is defaulted, but
+/// doing it here is deliberate, and not only so the setting can be *named* in
+/// an error: `ureq` answers "could not parse that" and "no proxy is
+/// configured" with the same `None`, and a launcher that quietly connects
+/// direct because `HTTPS_PROXY` had a typo in it is indistinguishable, from
+/// the user's side, from one that ignores the proxy on purpose. So an
+/// unusable value is an error here, not a shrug.
+fn proxy_from_env() -> Result<Option<ureq::Proxy>, Error> {
+    // Handles every form in the wild: `http://host:port`, `https://`,
+    // `socks5://`, credentials, and the scheme-less `host:port` — `ureq`
+    // parses that last one as a URI authority.
+    if let Some(proxy) = ureq::Proxy::try_from_env() {
+        return Ok(Some(proxy));
+    }
+    match proxy_env_value() {
+        // Nothing configured: connect direct, which is the overwhelming case.
+        None => Ok(None),
+        // Something *is* configured and none of it parsed.
+        Some((var, value)) => Err(Error::ProxyConfig {
+            var: var.to_string(),
+            value: redact_userinfo(&value),
+        }),
+    }
+}
+
+/// The trust anchors to verify servers against.
+///
+/// `None` means "the CA list compiled into the launcher". `Err` means the user
+/// named a bundle that yielded no certificate — see [`Error::CaBundle`] for why
+/// that is terminal rather than a fall back.
+fn root_certs_from_env() -> Result<Option<ureq::tls::RootCerts>, Error> {
+    let Some(path) = std::env::var(CA_BUNDLE_ENV)
+        .ok()
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+    else {
+        return Ok(None);
+    };
+
+    let bad = |detail: String| Error::CaBundle {
+        path: path.clone(),
+        detail,
+    };
+
+    let pem = std::fs::read(&path).map_err(|e| bad(e.to_string()))?;
+    let certs: Vec<ureq::tls::Certificate<'static>> = ureq::tls::parse_pem(&pem)
+        .filter_map(|item| match item {
+            // A bundle that also carries a key is normal; take the certs and
+            // ignore the rest rather than refusing the file.
+            Ok(ureq::tls::PemItem::Certificate(cert)) => Some(cert),
+            _ => None,
+        })
+        .collect();
+
+    if certs.is_empty() {
+        return Err(bad(
+            "the file parsed but contains no CERTIFICATE section".to_string()
+        ));
+    }
+    Ok(Some(ureq::tls::RootCerts::from(certs)))
+}
+
+/// Build the agent every request on the install/update path goes through.
+///
+/// Rebuilt per call rather than cached in a `OnceLock`: the launcher makes a
+/// handful of requests per run, to a handful of hosts, so there is no pool to
+/// preserve, and re-reading the environment keeps the proxy and CA settings
+/// honest instead of frozen at whichever request happened to come first.
+pub(crate) fn http_agent(budget: Budget) -> Result<ureq::Agent, Error> {
+    let mut config = ureq::Agent::config_builder()
+        .http_status_as_error(false) // callers classify the status themselves
+        .timeout_connect(Some(CONNECT_TIMEOUT))
+        .timeout_recv_response(Some(RESPONSE_TIMEOUT))
+        .timeout_global(Some(budget.global))
+        .proxy(proxy_from_env()?);
+
+    if let Some(roots) = root_certs_from_env()? {
+        config = config.tls_config(ureq::tls::TlsConfig::builder().root_certs(roots).build());
+    }
+
+    Ok(config.build().into())
+}
+
+/// Is this failure the TLS handshake rather than the network under it?
+///
+/// `ureq::Error` is `#[non_exhaustive]` and routes rustls failures through a
+/// feature-gated variant, so this asks the question two ways: the variants
+/// that are unconditionally TLS, then the rendered text for the rest.
+fn is_tls_failure(e: &ureq::Error) -> bool {
+    if matches!(e, ureq::Error::Tls(_) | ureq::Error::TlsRequired) {
+        return true;
+    }
+    let rendered = e.to_string().to_ascii_lowercase();
+    ["rustls:", "native-tls:", "certificate", "handshake"]
+        .iter()
+        .any(|needle| rendered.contains(needle))
+}
+
+/// The proxy and CA settings in effect, as the user would have to type them.
+fn transport_settings() -> String {
+    let proxy = match proxy_env_value() {
+        Some((name, value)) => format!("{name}={}", redact_userinfo(&value)),
+        None => "none set (ALL_PROXY / HTTPS_PROXY / HTTP_PROXY)".to_string(),
+    };
+    let ca = match std::env::var(CA_BUNDLE_ENV) {
+        Ok(path) if !path.trim().is_empty() => format!("{CA_BUNDLE_ENV}={}", path.trim()),
+        _ => format!("{CA_BUNDLE_ENV} not set"),
+    };
+    format!(
+        "\x20     proxy:     {proxy}\n\
+         \x20     CA bundle: {ca}"
+    )
+}
+
+/// Classify a `ureq` failure into the launcher's vocabulary, naming the
+/// settings that decide whether the request could have worked.
+///
+/// The TLS case is the one worth spelling out: the launcher verifies against
+/// the CA list compiled into it, *not* the machine's certificate store, so a
+/// TLS-intercepting corporate proxy fails here no matter how thoroughly the
+/// admin installed its root system-wide. Without this message the next person
+/// is guessing.
+pub(crate) fn transport_failure(e: &ureq::Error, budget: Budget) -> FeedError {
+    let settings = transport_settings();
+
+    if is_tls_failure(e) {
+        return FeedError::Tls(format!(
+            "{e}\n\
+             \x20   The launcher verifies TLS against the CA list compiled into it, not this\n\
+             \x20   machine's certificate store, so a TLS-intercepting proxy is rejected until\n\
+             \x20   it is told which CA signed what it is presenting.\n\
+             {settings}\n\
+             \x20   Fix it by exporting the intercepting CA (PEM, may hold a chain):\n\
+             \x20     export {CA_BUNDLE_ENV}=/etc/ssl/certs/ca-certificates.crt\n\
+             \x20   See docs/SUPPORT_MATRIX.md, \"Behind a TLS-intercepting proxy\"."
+        ));
+    }
+
+    if let ureq::Error::Timeout(which) = e {
+        let budget_secs = budget.global.as_secs();
+        return FeedError::Unreachable(format!(
+            "the {} timed out ({which})\n\
+             \x20   Budgets: connect {}s, response headers {}s, whole request {budget_secs}s.\n\
+             {settings}",
+            budget.what,
+            CONNECT_TIMEOUT.as_secs(),
+            RESPONSE_TIMEOUT.as_secs(),
+        ));
+    }
+
+    FeedError::Unreachable(format!("{e}\n{settings}"))
+}
 
 /// A GitHub token to raise the 60-req/hour unauthenticated allowance, if the
 /// environment offers one AND the feed is actually GitHub.
@@ -210,11 +473,8 @@ fn fetch_feed(url: &str) -> Result<String, Error> {
         cause,
     };
 
-    let mut request = ureq::get(url)
-        .config()
-        .http_status_as_error(false) // we classify the status ourselves
-        .timeout_global(Some(FEED_TIMEOUT))
-        .build()
+    let mut request = http_agent(FEED_BUDGET)?
+        .get(url)
         .header("Accept", "application/vnd.github+json")
         .header("User-Agent", "huitzo-launcher");
     if let Some(token) = github_token_for(url) {
@@ -223,7 +483,7 @@ fn fetch_feed(url: &str) -> Result<String, Error> {
 
     let mut response = request
         .call()
-        .map_err(|e| unavailable(FeedError::Unreachable(e.to_string())))?;
+        .map_err(|e| unavailable(transport_failure(&e, FEED_BUDGET)))?;
 
     let status = response.status().as_u16();
     if status != 200 {
@@ -419,10 +679,13 @@ pub fn find_platform_wheel(
             available.sort();
             Error::NoWheel {
                 platform: platform.to_string(),
-                // `None` only reaches here from `has_wheel_for`-style probes,
-                // which discard the error. The message always names a real
-                // interpreter on the install path.
-                python_version: python_version.unwrap_or((0, 0)),
+                // Passed through, never defaulted. `None` is reachable with the
+                // error kept: `--update` calls this with whatever
+                // `parse_python_version` made of the manifest's
+                // `python_version`, and a corrupt value there yields `None`.
+                // Flattening it to `(0, 0)` rendered "Interpreter: Python 0.0",
+                // a version that has never existed (R61).
+                python_version,
                 feed_version: release.version.clone(),
                 available,
             }
@@ -447,25 +710,42 @@ pub fn stream_to_file_with_hash(
             .map_err(|e| Error::PipInstall(format!("Failed to create dest dir: {e}")))?;
     }
 
-    let mut response = ureq::get(url)
+    let mut response = http_agent(DOWNLOAD_BUDGET)?
+        .get(url)
         .header("User-Agent", "huitzo-launcher")
         .call()
-        .map_err(|e| Error::Network(format!("Failed to fetch {url}: {e}")))?;
+        .map_err(|e| {
+            Error::Network(format!(
+                "Failed to fetch {url}: {}",
+                transport_failure(&e, DOWNLOAD_BUDGET)
+            ))
+        })?;
 
     let mut file = std::fs::File::create(dest)
         .map_err(|e| Error::PipInstall(format!("Failed to create {}: {e}", dest.display())))?;
 
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 8192];
+    let mut written: u64 = 0;
     let mut reader = response.body_mut().as_reader();
 
     loop {
-        let n = reader
-            .read(&mut buf)
-            .map_err(|e| Error::Network(format!("Download interrupted: {e}")))?;
+        // The global budget covers the body too, so a transfer that stalls
+        // mid-stream surfaces here rather than hanging: name the budget so the
+        // message is about the bound, not about an anonymous "interrupted".
+        let n = reader.read(&mut buf).map_err(|e| {
+            let _ = std::fs::remove_file(dest);
+            Error::Network(format!(
+                "Download of {url} interrupted after {} bytes: {e}\n\
+                 \x20 The whole download must finish within {}s.",
+                written,
+                DOWNLOAD_BUDGET.global_secs()
+            ))
+        })?;
         if n == 0 {
             break;
         }
+        written += n as u64;
         hasher.update(&buf[..n]);
         std::io::Write::write_all(&mut file, &buf[..n])
             .map_err(|e| Error::PipInstall(format!("Failed to write file: {e}")))?;
@@ -1166,7 +1446,7 @@ mod tests {
             panic!("expected NoWheel, got: {e}");
         };
         assert_eq!(got_platform, platform);
-        assert_eq!(*python_version, (3, 11));
+        assert_eq!(*python_version, Some((3, 11)));
         assert_eq!(feed_version, "0.2.3");
         // Sorted, so a user can scan it against their own key.
         let mut sorted = available.clone();
@@ -1200,4 +1480,425 @@ mod tests {
             "must not suggest another Python when no build exists: {msg}"
         );
     }
+
+    // --- R61: the message may not invent an interpreter --------------------
+
+    #[test]
+    fn an_unknown_interpreter_is_named_unknown_and_never_python_0_0() {
+        // The state `--update` reaches when the local manifest's
+        // `python_version` is corrupt: `parse_python_version` yields `None`,
+        // `apply_wheel_update` passes it straight through, and this is the
+        // error the user sees. It used to read "Interpreter: Python 0.0".
+        let release = make_release(&["some-other-platform-cp312"]);
+        let e = find_platform_wheel(&release, None).unwrap_err();
+
+        let Error::NoWheel { python_version, .. } = &e else {
+            panic!("expected NoWheel, got: {e}");
+        };
+        assert_eq!(*python_version, None, "the None must survive to the error");
+
+        let msg = e.to_string();
+        assert!(!msg.contains("Python 0.0"), "{msg}");
+        assert!(
+            !msg.contains("0.0"),
+            "no invented version may appear: {msg}"
+        );
+        assert!(msg.contains("Interpreter:   unknown"), "{msg}");
+        // The rest of the message still has to be useful.
+        assert!(
+            msg.contains(&format!("Platform key:  {}", this_platform())),
+            "{msg}"
+        );
+        assert!(msg.contains("cli-v0.2.3"), "{msg}");
+    }
+
+    #[test]
+    fn a_known_interpreter_is_still_named_exactly() {
+        // The other half of the same change: `Some` must not be lost while
+        // making `None` honest.
+        let release = make_release(&["some-other-platform-cp312"]);
+        let msg = find_platform_wheel(&release, Some((3, 13)))
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("Interpreter:   Python 3.13"), "{msg}");
+        assert!(!msg.contains("unknown"), "{msg}");
+    }
+
+    // --- M12: no request on the install/update path is unbounded ----------
+
+    /// Vars the transport reads. Process-global, so every test that touches
+    /// them takes the same lock the feed tests use.
+    const TRANSPORT_VARS: &[&str] = &[
+        "ALL_PROXY",
+        "all_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "NO_PROXY",
+        "no_proxy",
+        CA_BUNDLE_ENV,
+    ];
+
+    /// Run `f` with exactly `vars` set and every other transport variable
+    /// cleared, so an inherited `HTTPS_PROXY` on a developer machine cannot
+    /// change what a test observes.
+    fn with_transport_env<T>(vars: &[(&str, &str)], f: impl FnOnce() -> T) -> T {
+        let _guard = FEED_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let saved: Vec<(&str, Option<String>)> = TRANSPORT_VARS
+            .iter()
+            .map(|k| (*k, std::env::var(k).ok()))
+            .collect();
+        for (k, _) in &saved {
+            unsafe { std::env::remove_var(k) };
+        }
+        for (k, v) in vars {
+            unsafe { std::env::set_var(k, v) };
+        }
+        let out = f();
+        for (k, _) in vars {
+            unsafe { std::env::remove_var(k) };
+        }
+        for (k, v) in saved {
+            if let Some(v) = v {
+                unsafe { std::env::set_var(k, v) };
+            }
+        }
+        out
+    }
+
+    /// A socket that completes the TCP handshake and then says nothing, ever.
+    /// Returns its address; the listener thread outlives the test on purpose.
+    fn blackhole() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr").to_string();
+        std::thread::spawn(move || {
+            // Hold every accepted connection open without writing a byte.
+            let mut held = Vec::new();
+            for stream in listener.incoming() {
+                match stream {
+                    Ok(s) => held.push(s),
+                    Err(_) => break,
+                }
+            }
+        });
+        addr
+    }
+
+    #[test]
+    fn every_request_family_carries_a_connect_and_a_global_timeout() {
+        // The wiring, not the numbers: dropping any of these builder calls
+        // restores the unbounded request M12 is about.
+        for budget in [FEED_BUDGET, DOWNLOAD_BUDGET] {
+            let agent = with_transport_env(&[], || http_agent(budget)).expect("agent");
+            let timeouts = agent.config().timeouts();
+            assert_eq!(timeouts.connect, Some(CONNECT_TIMEOUT), "{}", budget.what);
+            assert_eq!(
+                timeouts.recv_response,
+                Some(RESPONSE_TIMEOUT),
+                "{}",
+                budget.what
+            );
+            assert_eq!(timeouts.global, Some(budget.global), "{}", budget.what);
+        }
+        // The wheel is the big artefact: its budget must be the generous one.
+        assert!(DOWNLOAD_BUDGET.global > FEED_BUDGET.global);
+        // …and generous enough for a ~50 MB wheel on a genuinely slow link.
+        assert!(50 * 1024 * 1024 / DOWNLOAD_BUDGET.global_secs() < 64 * 1024);
+    }
+
+    #[test]
+    fn a_blackholed_host_fails_on_the_budget_instead_of_hanging() {
+        // Same plumbing as a real download, with the budget compressed so the
+        // suite does not wait 15 minutes to prove there is one.
+        let budget = Budget {
+            what: "test download",
+            global: std::time::Duration::from_millis(750),
+        };
+        let url = format!("http://{}/wheel.whl", blackhole());
+
+        let started = std::time::Instant::now();
+        let err = with_transport_env(&[], || {
+            http_agent(budget)
+                .expect("agent")
+                .get(&url)
+                .call()
+                .expect_err("a blackholed host must not succeed")
+        });
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "took {elapsed:?} — the budget did not apply"
+        );
+        let cause = transport_failure(&err, budget).to_string();
+        assert!(cause.contains("timed out"), "{cause}");
+        assert!(cause.contains("test download"), "{cause}");
+    }
+
+    // --- m15: proxy and custom CA ------------------------------------------
+
+    #[test]
+    fn the_proxy_environment_is_read_and_routed_through() {
+        let proxy = with_transport_env(&[("HTTPS_PROXY", "http://proxy.corp:8080")], || {
+            http_agent(FEED_BUDGET)
+                .expect("agent")
+                .config()
+                .proxy()
+                .cloned()
+        })
+        .expect("HTTPS_PROXY must reach the agent, not just parse");
+        assert_eq!(proxy.host(), "proxy.corp");
+        assert_eq!(proxy.port(), 8080);
+    }
+
+    #[test]
+    fn every_spelling_a_corporate_setup_hands_out_is_honoured() {
+        // The forms that turn up in a corporate profile. Each must produce a
+        // proxy, not a silent direct connection.
+        for (value, host, port) in [
+            ("http://proxy.corp:8080", "proxy.corp", 8080),
+            ("https://proxy.corp:8443", "proxy.corp", 8443),
+            // Scheme-less `host:port` — parsed as a URI authority.
+            ("proxy.corp:8080", "proxy.corp", 8080),
+            ("alice:hunter2@proxy.corp:8080", "proxy.corp", 8080),
+        ] {
+            let proxy = with_transport_env(&[("HTTPS_PROXY", value)], proxy_from_env)
+                .unwrap_or_else(|e| panic!("{value}: {e}"))
+                .unwrap_or_else(|| panic!("{value}: went direct"));
+            assert_eq!(proxy.host(), host, "{value}");
+            assert_eq!(proxy.port(), port, "{value}");
+        }
+    }
+
+    #[test]
+    fn a_proxy_variable_that_cannot_be_parsed_is_refused_not_ignored() {
+        // `ureq` answers "unparseable" and "not configured" with the same
+        // `None`. Treating the first as the second connects direct on a
+        // machine whose only route out is the proxy — and says nothing.
+        let err = with_transport_env(&[("HTTPS_PROXY", "proxy.corp:8080/")], || {
+            http_agent(FEED_BUDGET).expect_err("an unusable proxy must be refused")
+        });
+        assert!(matches!(err, Error::ProxyConfig { .. }), "{err}");
+        let msg = err.to_string();
+        assert!(msg.contains("HTTPS_PROXY=proxy.corp:8080/"), "{msg}");
+        assert!(msg.contains("Nothing was installed"), "{msg}");
+        assert_eq!(crate::errors::exit_code(&err), 78);
+    }
+
+    #[test]
+    fn an_unparseable_proxy_password_is_not_echoed_into_the_refusal() {
+        let err = with_transport_env(&[("HTTPS_PROXY", "alice:hunter2@proxy.corp:8080/")], || {
+            http_agent(FEED_BUDGET).expect_err("must be refused")
+        });
+        let msg = err.to_string();
+        assert!(!msg.contains("hunter2"), "{msg}");
+        assert!(msg.contains("***@proxy.corp:8080/"), "{msg}");
+    }
+
+    #[test]
+    fn no_proxy_carves_out_direct_routes() {
+        let proxy = with_transport_env(
+            &[
+                ("HTTPS_PROXY", "http://proxy.corp:8080"),
+                ("NO_PROXY", "localhost,.internal.corp"),
+            ],
+            proxy_from_env,
+        )
+        .expect("a valid proxy")
+        .expect("proxy");
+        let bypass = |host: &str| {
+            proxy.is_no_proxy(
+                &format!("https://{host}/x")
+                    .parse::<ureq::http::Uri>()
+                    .unwrap(),
+            )
+        };
+        assert!(bypass("localhost"));
+        assert!(bypass("git.internal.corp"));
+        assert!(!bypass("api.github.com"));
+    }
+
+    #[test]
+    fn no_proxy_variable_at_all_means_a_direct_connection() {
+        let proxy = with_transport_env(&[], proxy_from_env).expect("not an error");
+        assert!(proxy.is_none(), "{proxy:?}");
+        // …and an empty value is "not configured", not "unusable".
+        let proxy = with_transport_env(&[("HTTPS_PROXY", "")], proxy_from_env)
+            .expect("an empty value is not an error");
+        assert!(proxy.is_none(), "{proxy:?}");
+    }
+
+    #[test]
+    fn a_proxy_password_is_not_echoed_into_an_error_message() {
+        assert_eq!(
+            redact_userinfo("http://alice:hunter2@proxy.corp:8080"),
+            "http://***@proxy.corp:8080"
+        );
+        assert_eq!(
+            redact_userinfo("http://proxy.corp:8080"),
+            "http://proxy.corp:8080"
+        );
+    }
+
+    #[test]
+    fn a_ca_bundle_replaces_the_bundled_roots() {
+        // Two anchors in one file: a bundle is a chain, not a single cert.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bundle = dir.path().join("corp.pem");
+        std::fs::write(&bundle, two_pem_certificates()).expect("write");
+
+        let roots = with_transport_env(
+            &[(CA_BUNDLE_ENV, bundle.to_str().expect("utf-8 path"))],
+            || root_certs_from_env().expect("a valid bundle must load"),
+        )
+        .expect("a bundle was configured, so roots must be Specific");
+        match roots {
+            ureq::tls::RootCerts::Specific(certs) => assert_eq!(certs.len(), 2),
+            other => panic!("expected Specific roots, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unusable_ca_bundle_is_terminal_rather_than_a_silent_fallback() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // A file that is not PEM at all.
+        let junk = dir.path().join("not-a-cert.pem");
+        std::fs::write(&junk, b"this is not a certificate\n").expect("write");
+        let err = with_transport_env(
+            &[(CA_BUNDLE_ENV, junk.to_str().expect("utf-8 path"))],
+            || http_agent(FEED_BUDGET).expect_err("must refuse"),
+        );
+        assert!(matches!(err, Error::CaBundle { .. }), "{err}");
+        let msg = err.to_string();
+        assert!(msg.contains("HUITZO_CA_BUNDLE"), "{msg}");
+        assert!(msg.contains("Nothing was installed"), "{msg}");
+        // EX_CONFIG: the machine is misconfigured, this is not a retryable blip.
+        assert_eq!(crate::errors::exit_code(&err), 78);
+
+        // A path that does not exist.
+        let missing = dir.path().join("absent.pem");
+        let err = with_transport_env(
+            &[(CA_BUNDLE_ENV, missing.to_str().expect("utf-8 path"))],
+            || http_agent(FEED_BUDGET).expect_err("must refuse"),
+        );
+        assert!(matches!(err, Error::CaBundle { .. }), "{err}");
+    }
+
+    #[test]
+    fn an_empty_ca_bundle_variable_means_the_bundled_roots() {
+        // Unset and set-to-empty must behave the same; an empty string is how
+        // a shell profile spells "not configured".
+        for value in ["", "   "] {
+            let roots = with_transport_env(&[(CA_BUNDLE_ENV, value)], || {
+                root_certs_from_env().expect("empty is not an error")
+            });
+            assert!(roots.is_none(), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn a_tls_failure_names_the_proxy_and_the_ca_setting() {
+        let err = ureq::Error::Tls("invalid peer certificate: UnknownIssuer");
+        let cause = with_transport_env(
+            &[
+                ("HTTPS_PROXY", "http://alice:hunter2@proxy.corp:8080"),
+                (CA_BUNDLE_ENV, "/etc/corp/root.pem"),
+            ],
+            || transport_failure(&err, FEED_BUDGET),
+        );
+
+        assert!(matches!(cause, FeedError::Tls(_)), "{cause}");
+        let msg = cause.to_string();
+        assert!(msg.contains("TLS handshake failed"), "{msg}");
+        // The two settings that decide whether this could ever have worked.
+        assert!(
+            msg.contains("HTTPS_PROXY=http://***@proxy.corp:8080"),
+            "{msg}"
+        );
+        assert!(msg.contains("HUITZO_CA_BUNDLE=/etc/corp/root.pem"), "{msg}");
+        // Credentials from the proxy URL must not be in it.
+        assert!(!msg.contains("hunter2"), "{msg}");
+        // And the remedy, not just the diagnosis.
+        assert!(msg.contains("export HUITZO_CA_BUNDLE="), "{msg}");
+    }
+
+    #[test]
+    fn a_tls_failure_with_nothing_configured_says_so_instead_of_staying_silent() {
+        let err = ureq::Error::Tls("invalid peer certificate: UnknownIssuer");
+        let msg = with_transport_env(&[], || transport_failure(&err, FEED_BUDGET)).to_string();
+        assert!(msg.contains("none set"), "{msg}");
+        assert!(msg.contains("HUITZO_CA_BUNDLE not set"), "{msg}");
+    }
+
+    #[test]
+    fn a_plain_connection_failure_is_not_reported_as_a_tls_problem() {
+        // Port 1 on loopback: refused immediately, nothing to do with TLS.
+        // `fetch_feed` directly rather than `feed_cause`, which takes the same
+        // lock `with_transport_env` is already holding.
+        let cause = with_transport_env(&[], || match fetch_feed("http://127.0.0.1:1/releases") {
+            Err(Error::FeedUnavailable { cause, .. }) => cause,
+            other => panic!("expected FeedUnavailable, got {other:?}"),
+        });
+        assert!(matches!(cause, FeedError::Unreachable(_)), "{cause}");
+        assert!(
+            !cause.to_string().contains("TLS handshake failed"),
+            "{cause}"
+        );
+    }
+
+    /// Two self-signed certificates in one PEM file. Generated once and pasted
+    /// in rather than built at test time: the launcher has no certificate
+    /// *authoring* dependency and must not grow one to test that it can read
+    /// a bundle.
+    fn two_pem_certificates() -> String {
+        format!("{TEST_CERT_A}\n{TEST_CERT_B}\n")
+    }
+
+    /// A throwaway self-signed root, valid to 2126. Never trusted by anything;
+    /// it exists only so `root_certs_from_env` has real DER to parse.
+    const TEST_CERT_A: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIDLzCCAhegAwIBAgIUO6Wxt6UfRlwaiFJTVO4n0rVRnQMwDQYJKoZIhvcNAQEL\n\
+BQAwJjEkMCIGA1UEAwwbSHVpdHpvIExhdW5jaGVyIFRlc3QgUm9vdCBBMCAXDTI2\n\
+MDkxNjAzMDQ1OFoYDzIxMjYwODIzMDMwNDU4WjAmMSQwIgYDVQQDDBtIdWl0em8g\n\
+TGF1bmNoZXIgVGVzdCBSb290IEEwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEK\n\
+AoIBAQC7UmGS2vD0PW+SpakCP4mdvow7b963zwKGleh06doAeFRPQCihGyobil20\n\
+P0sB/0UiHJwfJWtpbbyHX09C6QmyWJyuJeoLCmEosy/QRa/4W1qM64pchSMT3cXs\n\
+jDzUOe/KnfXFa2TKqEms0bTxcu09kl56eaBPRzEbrg+vg7R7u5mLGLA2e+2xxr62\n\
+E9iNyXe56MhmDyifp45/SLEIitTEUWSA3BaQJc3aDKRZdSnovregzc/J62ZIiIIH\n\
+wgROliCZKmSwja6/mNIjS3MriqkoIlRjdujYXY0YXJ3FxrWFg2dwmcq8glPch5o9\n\
+XxO9EKaeP+nUCpU+KIomHc2D29adAgMBAAGjUzBRMB0GA1UdDgQWBBRjD2hFZ0d6\n\
+E/Q3/M6+At90j0G2oTAfBgNVHSMEGDAWgBRjD2hFZ0d6E/Q3/M6+At90j0G2oTAP\n\
+BgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCwUAA4IBAQCCeoHW0tQRysZFreQd\n\
++38IAmVNrnLqTvjjv3B35JeIabFHuugh20s4bGTJE8eouRDYcGU6riqBt60BSlR0\n\
+HnBKrOOKfrTQHo0lISysNQMrgr18tQCQE6MtSZcuLLHvcX/ZUwz2lvJ9Ffwveudt\n\
+BKYczKBEhJ8xtMVfos6kBuTOuPU2GU4Kob96AFaBEpXlT22coxELqN5QcfEm7y3e\n\
+QWHqMD+c44tyWTnQUTAYxnh1HdAZLEZ4a4eYZLu/EM7XpzkiS/oeQE9LH2V3PaO4\n\
+8R/z0YXhiXWr6XI6bpJtsg+OFadVoRm2nbinFbV9VNie1Mt6MX9gFfr5QFba1iiK\n\
+1Sb+\n\
+-----END CERTIFICATE-----";
+
+    /// A second throwaway root, so the bundle under test is a chain and not
+    /// a single certificate.
+    const TEST_CERT_B: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIDLzCCAhegAwIBAgIUbDDLKOwgpdlMuPgGmBA7mW0vnN0wDQYJKoZIhvcNAQEL\n\
+BQAwJjEkMCIGA1UEAwwbSHVpdHpvIExhdW5jaGVyIFRlc3QgUm9vdCBCMCAXDTI2\n\
+MDkxNjAzMDQ1OFoYDzIxMjYwODIzMDMwNDU4WjAmMSQwIgYDVQQDDBtIdWl0em8g\n\
+TGF1bmNoZXIgVGVzdCBSb290IEIwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEK\n\
+AoIBAQCz7M7FAjlhODBfPuhNG0TZukZVWTP5p0j4wCZbfRjEyv1ypc8+bOz4wuNs\n\
+rsk3mfmtDa5ErEbDmQxDbSvW5OiAvSxR4No/zDSn8ZmQUVwCNpvBVnEfZviMEpgD\n\
+i6d1wIgF+fBKfD31lh2aa5DVHlH+Qjc0WBXvP3BzPUwpfo/tBEVS8l58PZmucRX8\n\
+FhfJV0I5i+9mRzwaeIiIZaLJ5oBV+6YoKz/H3yjIEOqxfMkNxmC/23EdwbhpzT9B\n\
+ryQpSL/L2MuT8LoJ5Trrn4TxpRVVeN3AKelv7RrKY4LtTMFdSdwTRLDmz1jL7KT1\n\
+AcOnvodz2D84/2oQbJ5VUC+I5zHnAgMBAAGjUzBRMB0GA1UdDgQWBBTKvgOf5RIb\n\
+SCqjzCfmrtS1Q+3j1jAfBgNVHSMEGDAWgBTKvgOf5RIbSCqjzCfmrtS1Q+3j1jAP\n\
+BgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCwUAA4IBAQAyEmYUaPPxA40oLy1x\n\
+1pW0P42PrxBxZljiphv90IDtw3xq5/OvfGRBP97dY/T8ravwBXwOd9CpmFbx5/vo\n\
+oU4iy45XhzsYr/CzW5x90NyGhZSjVgbwS84hxUf0wBjykFV6T922fpT+JQ4AG4wV\n\
+UCPUdGPPX/wQOpCE75zKjhxDQ7XKAaqn6guMTH5uMxnGMOvzXU5BhChOj2cqVLLF\n\
+EHYOMakPijZ7TOf2Mcnm0f6/9NdmRc+Mp+w+OqnKpZs1+N3FOu+iTPg7vYg2w/Gs\n\
+a0ZtUE7ExlbkzgBNxK28NdSYYhsZj5H4YCzMBxo6dFFcrL0Khul+oIVLnY3IDrxq\n\
+hXTV\n\
+-----END CERTIFICATE-----";
 }
