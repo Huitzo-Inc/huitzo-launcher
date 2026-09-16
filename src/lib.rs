@@ -18,4 +18,8 @@ pub mod keys;
 pub mod local_cli;
 pub mod manifest;
 pub mod prober;
+pub mod python;
 pub mod update;
+pub mod uv;
+pub mod uv_manifest;
+pub mod venv;

@@ -35,6 +35,9 @@ pub struct UvAsset {
 }
 
 impl UvAsset {
+    // Windows selects the `.zip` asset exclusively, so the tar.gz constructor is
+    // unreferenced there.
+    #[cfg_attr(windows, allow(dead_code))]
     const fn targz(filename: &'static str, sha256: &'static str) -> Self {
         Self {
             filename,

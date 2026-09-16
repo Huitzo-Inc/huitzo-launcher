@@ -3,12 +3,42 @@
 
 use std::fmt;
 
+use crate::python::MIN_PYTHON;
+use crate::uv::PROVISIONED_PYTHON;
+
+/// Indent a captured subprocess stderr block so it reads as quoted output
+/// rather than as more of the launcher's own prose.
+fn indent(detail: &str) -> String {
+    let trimmed = detail.trim_end();
+    if trimmed.is_empty() {
+        return "    (no output)".to_string();
+    }
+    trimmed
+        .lines()
+        .map(|l| format!("    {l}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Launcher error types with user-facing messages.
 pub enum Error {
-    /// No Python 3.11+ found on PATH.
-    NoPython,
-    /// Virtual environment creation failed.
-    VenvCreate(String),
+    /// No usable Python 3.11+ interpreter could be found OR provisioned.
+    ///
+    /// `searched` lists what discovery actually looked at; `provision` carries
+    /// the reason `uv python install` could not supply one. With D1 the
+    /// launcher provisions its own CPython, so "not installed on this host" is
+    /// no longer a cause on its own — one of these two fields always names the
+    /// real one.
+    NoPython {
+        searched: Vec<String>,
+        provision: Option<String>,
+    },
+    /// `uv venv` failed for a specific interpreter.
+    VenvCreate { interpreter: String, detail: String },
+    /// The existing managed venv could not be removed.
+    VenvRemove(String),
+    /// `uv` — a hard dependency of first run since D1 — could not be staged.
+    UvUnavailable(String),
     /// pip install failed.
     PipInstall(String),
     /// HTTP request failed (PyPI, GitHub).
@@ -43,19 +73,67 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::NoPython => write!(
+            Error::NoPython {
+                searched,
+                provision,
+            } => {
+                let min = format!("{}.{}", MIN_PYTHON.0, MIN_PYTHON.1);
+                let searched = if searched.is_empty() {
+                    "    (nothing on PATH matched)".to_string()
+                } else {
+                    searched
+                        .iter()
+                        .map(|p| format!("    {p}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                match provision {
+                    // The launcher tried to download its own CPython and that
+                    // is what failed. Naming `uv python install` is the whole
+                    // point: "install Python yourself" would be wrong advice.
+                    Some(detail) => write!(
+                        f,
+                        "No usable Python {min}+ interpreter, and one could not be downloaded.\n\n\
+                         \x20 Interpreters examined:\n{searched}\n\
+                         \x20 `uv python install {PROVISIONED_PYTHON}` failed:\n    {detail}\n\n\
+                         The launcher downloads its own Python, so this is a network, proxy or\n\
+                         disk-space problem rather than a missing system Python. Retry once the\n\
+                         connection is available; nothing was installed."
+                    ),
+                    None => write!(
+                        f,
+                        "No usable Python {min}+ interpreter could be selected.\n\n\
+                         \x20 Interpreters examined:\n{searched}"
+                    ),
+                }
+            }
+            Error::VenvCreate {
+                interpreter,
+                detail,
+            } => write!(
                 f,
-                "Python 3.11+ required but not found.\n\
-                 Searched: python3.14, python3.13, python3.12, python3.11, python3, python\n\n\
-                 Install Python:\n\
-                 \x20 macOS:  brew install python@3.13\n\
-                 \x20 Ubuntu: sudo apt install python3.13\n\
-                 \x20 Windows: winget install Python.Python.3.13"
+                "Failed to create the managed virtual environment.\n\n\
+                 \x20 Interpreter: {interpreter}\n\
+                 \x20 `uv venv` reported:\n{}\n\n\
+                 The managed venv is built by `uv venv`, which does not use `ensurepip` —\n\
+                 a distro `python3-venv` package is NOT the missing piece. The partial venv\n\
+                 was removed, so re-running `huitzo` starts clean; if it keeps failing,\n\
+                 report the `uv venv` output above at\n\
+                 https://github.com/Huitzo-Inc/huitzo-launcher/issues",
+                indent(detail)
             ),
-            Error::VenvCreate(detail) => write!(
+            Error::VenvRemove(detail) => write!(
                 f,
-                "Failed to create virtual environment.\n{detail}\n\n\
-                 Try: rm -rf ~/.huitzo/venv && huitzo"
+                "Could not remove the existing managed environment.\n{detail}\n\n\
+                 Check the permissions on $HUITZO_HOME (default ~/.huitzo)."
+            ),
+            Error::UvUnavailable(detail) => write!(
+                f,
+                "Could not set up uv, which the launcher needs to build its Python\n\
+                 environment.\n\n\
+                 \x20 {detail}\n\n\
+                 uv is downloaded from https://github.com/astral-sh/uv/releases — check your\n\
+                 network or proxy and retry. Nothing was installed."
             ),
             Error::PipInstall(detail) => write!(
                 f,
@@ -130,11 +208,13 @@ impl fmt::Debug for Error {
 /// Exit codes following sysexits.h conventions.
 pub fn exit_code(err: &Error) -> i32 {
     match err {
-        Error::NoPython => 78,      // EX_CONFIG
-        Error::VenvCreate(_) => 73, // EX_CANTCREAT
-        Error::PipInstall(_) => 69, // EX_UNAVAILABLE
-        Error::Network(_) => 69,    // EX_UNAVAILABLE
-        Error::Manifest(_) => 66,   // EX_NOINPUT
+        Error::NoPython { .. } => 78,   // EX_CONFIG
+        Error::VenvCreate { .. } => 73, // EX_CANTCREAT
+        Error::VenvRemove(_) => 73,     // EX_CANTCREAT
+        Error::UvUnavailable(_) => 69,  // EX_UNAVAILABLE — a fetch failed
+        Error::PipInstall(_) => 69,     // EX_UNAVAILABLE
+        Error::Network(_) => 69,        // EX_UNAVAILABLE
+        Error::Manifest(_) => 66,       // EX_NOINPUT
         Error::SelfUpdate(_) => 1,
         Error::Exec(_) => 126,              // Command found but not executable
         Error::TrustViolation { .. } => 77, // EX_NOPERM
@@ -144,5 +224,79 @@ pub fn exit_code(err: &Error) -> i32 {
         Error::ConsentDeclined => 70, // EX_SOFTWARE-adjacent slot, reserved here for user-decline
         // The environment, not the launcher, is misconfigured (#53).
         Error::LocalCliUnavailable { .. } => 78, // EX_CONFIG
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The `rm -rf ~/.huitzo/venv` hint (#B3) was the wrong remedy for every
+    /// cause that actually produced it. No message on the first-run path may
+    /// suggest it again.
+    fn assert_no_stale_remedy(msg: &str) {
+        assert!(
+            !msg.contains("rm -rf"),
+            "message still suggests deleting the venv:\n{msg}"
+        );
+        assert!(
+            !msg.contains("apt install"),
+            "message still tells the user to install a system Python:\n{msg}"
+        );
+    }
+
+    #[test]
+    fn venv_failure_names_uv_and_the_interpreter_not_a_missing_distro_package() {
+        let msg = Error::VenvCreate {
+            interpreter: "/usr/bin/python3.12".to_string(),
+            detail: "error: Failed to create virtualenv\n  Caused by: no space left on device"
+                .to_string(),
+        }
+        .to_string();
+        assert!(msg.contains("/usr/bin/python3.12"), "{msg}");
+        assert!(msg.contains("uv venv"), "{msg}");
+        assert!(msg.contains("no space left on device"), "{msg}");
+        // The #B3 misdiagnosis, inverted: the message must actively say that a
+        // distro venv package is NOT the missing piece.
+        assert!(msg.contains("ensurepip"), "{msg}");
+        assert_no_stale_remedy(&msg);
+    }
+
+    #[test]
+    fn no_python_blames_the_failed_download_not_the_absent_system_python() {
+        let msg = Error::NoPython {
+            searched: vec!["/usr/bin/python3.9 — Python 3.9, via PATH".to_string()],
+            provision: Some(
+                "error: Request failed after 3 retries: connection refused".to_string(),
+            ),
+        }
+        .to_string();
+        assert!(msg.contains("uv python install"), "{msg}");
+        assert!(msg.contains(PROVISIONED_PYTHON), "{msg}");
+        assert!(msg.contains("connection refused"), "{msg}");
+        assert!(msg.contains("/usr/bin/python3.9"), "{msg}");
+        assert_no_stale_remedy(&msg);
+    }
+
+    #[test]
+    fn uv_failure_names_uv_as_the_cause() {
+        let msg =
+            Error::UvUnavailable("checksum mismatch on the uv archive".to_string()).to_string();
+        assert!(msg.contains("uv"), "{msg}");
+        assert!(msg.contains("checksum mismatch on the uv archive"), "{msg}");
+        assert_no_stale_remedy(&msg);
+        // uv is a fetch dependency, so it exit-codes as unavailable (69), not
+        // as a config error the user is expected to fix by hand.
+        assert_eq!(
+            exit_code(&Error::UvUnavailable(String::new())),
+            69,
+            "EX_UNAVAILABLE"
+        );
+    }
+
+    #[test]
+    fn subprocess_output_is_indented_and_empty_output_is_labelled() {
+        assert_eq!(indent("a\nb\n"), "    a\n    b");
+        assert_eq!(indent("   \n"), "    (no output)");
     }
 }

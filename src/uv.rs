@@ -19,12 +19,21 @@
 //! continues; a runner without uv reports the honest `build_tools_missing` in Studio.
 
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use crate::dirs;
 use crate::download;
 use crate::errors::Error;
 use crate::uv_manifest::{PINNED_UV_VERSION, uv_asset_for_host, uv_download_url};
+
+/// The CPython version the launcher provisions when the host has no usable
+/// interpreter (D1).
+///
+/// MUST be a version the CLI release feed publishes a wheel for — the feed ships
+/// `cp312` and `cp313`, and 3.13 is the newer of the two, so a provisioned host
+/// lands on the same ABI the project builds for first.
+pub const PROVISIONED_PYTHON: &str = "3.13";
 
 /// Ensure the pinned `uv` is staged at `<huitzo_home>/bin/uv` (idempotent).
 ///
@@ -42,7 +51,7 @@ pub fn ensure_uv() -> Result<(), Error> {
         return Ok(());
     }
 
-    eprintln!("  Setting up uv {PINNED_UV_VERSION} (Studio build tool)...");
+    eprintln!("  Setting up uv {PINNED_UV_VERSION} (Python environment manager)...");
     let archive = dirs::huitzo_home().join("cache").join(asset.filename);
 
     // 1. Download + VERIFY the archive against the compiled-in sha256 (trust anchor).
@@ -211,6 +220,68 @@ fn make_executable(dest: &Path) -> Result<(), Error> {
 
 #[cfg(not(unix))]
 fn make_executable(_dest: &Path) -> Result<(), Error> {
+    Ok(())
+}
+
+/// A `Command` for the staged uv with the launcher's environment applied.
+///
+/// `UV_PYTHON_INSTALL_DIR` keeps provisioned interpreters inside `$HUITZO_HOME`
+/// rather than uv's user-global data dir: the managed venv symlinks its base
+/// interpreter, so that interpreter has to live somewhere the launcher owns and
+/// a sandboxed `HUITZO_HOME` fully contains.
+pub fn command(uv_bin: &Path) -> Command {
+    let mut cmd = Command::new(uv_bin);
+    cmd.env("UV_PYTHON_INSTALL_DIR", dirs::uv_python_dir());
+    cmd
+}
+
+/// Ensure uv is staged and return its path, treating failure as fatal.
+///
+/// Since D1 uv builds the managed venv and provisions CPython, so first run
+/// cannot proceed without it. `ensure_uv` degrades silently for the Studio
+/// build-tool use; this wrapper is for callers where uv IS the dependency, and
+/// it names uv as the cause rather than surfacing a later, misleading
+/// "no Python" or "venv failed".
+pub fn ensure_uv_required() -> Result<PathBuf, Error> {
+    if uv_asset_for_host().is_none() {
+        return Err(Error::UvUnavailable(format!(
+            "no pinned uv {PINNED_UV_VERSION} build exists for this platform ({}-{})",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        )));
+    }
+    ensure_uv().map_err(|e| Error::UvUnavailable(e.to_string()))?;
+
+    let dest = dirs::uv_bin();
+    if !dest.is_file() {
+        return Err(Error::UvUnavailable(format!(
+            "uv reported success but nothing was staged at {}",
+            dest.display()
+        )));
+    }
+    Ok(dest)
+}
+
+/// Provision a uv-managed CPython `version` under `$HUITZO_HOME/python`.
+///
+/// Returns the raw `uv python install` stderr on failure so the caller can put
+/// it in front of the user — "download your own Python" is never actionable
+/// advice, but "the download failed because …" is.
+pub fn install_python(uv_bin: &Path, version: &str) -> Result<(), String> {
+    let output = command(uv_bin)
+        .args(["python", "install", version])
+        .output()
+        .map_err(|e| format!("could not run {}: {e}", uv_bin.display()))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        return Err(if stderr.is_empty() {
+            format!("exited with {}", output.status)
+        } else {
+            stderr.to_string()
+        });
+    }
     Ok(())
 }
 

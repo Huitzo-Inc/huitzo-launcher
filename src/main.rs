@@ -19,6 +19,8 @@ mod uv;
 mod uv_manifest;
 mod venv;
 
+use std::path::Path;
+
 use errors::Error;
 use local_cli::{Decision, LocalSource};
 use manifest::Manifest;
@@ -312,8 +314,8 @@ fn run_with(args: Vec<String>, force_trust_rotate: bool, use_installed: bool) {
     }
 
     // 8. Exec into Python CLI (never returns on Unix). The managed venv is
-    //    guaranteed Python 3.11+ by `python::discover_all`, so `-P` is always
-    //    safe here.
+    //    guaranteed Python 3.11+ — `create_managed_venv` re-probes the finished
+    //    environment against `python::MIN_PYTHON` — so `-P` is always safe here.
     if let Err(e) = exec::exec_into_python(&dirs::venv_python(), &args, true) {
         eprintln!("Error: {e}");
         std::process::exit(errors::exit_code(&e));
@@ -414,19 +416,25 @@ fn bootstrap() -> Result<(), Error> {
         return Err(Error::ConsentDeclined);
     }
 
-    let candidates = python::discover_all()?;
+    // uv builds the managed venv and provisions CPython when the host has none
+    // (D1), so it must be staged BEFORE anything Python-shaped is attempted. A
+    // uv that cannot be fetched is reported as exactly that — never as a
+    // downstream "no Python" or "venv failed", which is what made #B2/#B3 so
+    // hard to act on.
+    let uv_bin = uv::ensure_uv_required()?;
 
     // Fetch the release manifest once — used to score Python candidates.
     // Network failure is non-fatal here; we degrade to PyPI fallback.
     let release = download::fetch_cli_release().ok();
 
-    let py_used = select_python(&candidates, release.as_ref())?;
+    let py_used = create_managed_venv(&uv_bin, release.as_ref())?;
 
     eprintln!(
-        "  Using Python {}.{} at {}",
+        "  Using Python {}.{} at {} [{}]",
         py_used.version.0,
         py_used.version.1,
-        py_used.path.display()
+        py_used.path.display(),
+        py_used.source.label()
     );
 
     // Install huitzo: try compiled wheel from the already-fetched release, fall back to PyPI
@@ -479,83 +487,139 @@ fn bootstrap() -> Result<(), Error> {
     Ok(())
 }
 
-/// Select the best Python interpreter from `candidates` for the managed venv.
+/// Build the managed venv, and report the interpreter it ended up running on.
 ///
-/// Pass 1: prefer a Python that both creates a venv successfully AND has a
-///         compiled wheel in `release` (if provided).
-/// Pass 2: if pass 1 yields nothing, accept the first Python that creates a
-///         venv — wheel-less fallback will use PyPI.
-fn select_python<'a>(
-    candidates: &'a [python::PythonInfo],
+/// Order of attempts:
+///   1. Interpreters already on the host, wheel-compatible ones first
+///      (`python::prefer_wheel_compatible`) — reusing one saves a ~25 MB
+///      CPython download and is the common case.
+///   2. Failing that, `uv python install` provisions a pinned CPython.
+///
+/// Every attempt goes through `uv venv`, which writes the environment itself
+/// instead of shelling `python -m venv`; that is what makes a stock
+/// `apt install python3` host work without `python3.N-venv` (#B3).
+fn create_managed_venv(
+    uv_bin: &Path,
     release: Option<&download::CliRelease>,
-) -> Result<&'a python::PythonInfo, Error> {
-    // Pass 1: wheel-compatible Python preferred (skipped if no release manifest)
-    if let Some(rel) = release {
-        for py in candidates {
-            if !download::has_wheel_for(rel, py.version) {
-                continue;
-            }
-            if try_venv(py) {
-                return Ok(py);
-            }
-        }
-    }
+) -> Result<python::PythonInfo, Error> {
+    let has_wheel = |v: (u8, u8)| release.is_some_and(|r| download::has_wheel_for(r, v));
 
-    // Pass 2: any working Python (will fall back to PyPI)
-    let mut last_err: Option<Error> = None;
-    for py in candidates {
+    let candidates = python::discover_all();
+    let mut searched: Vec<String> = Vec::new();
+
+    for py in python::prefer_wheel_compatible(&candidates, has_wheel) {
+        let wheel_note = if has_wheel(py.version) {
+            " (has compiled wheel)"
+        } else {
+            ""
+        };
         eprintln!(
-            "  Trying Python {}.{} at {}",
+            "  Trying Python {}.{} at {} [{}]{}",
             py.version.0,
             py.version.1,
-            py.path.display()
+            py.path.display(),
+            py.source.label(),
+            wheel_note
         );
-        let venv_dir = dirs::venv_dir();
-        if venv_dir.exists() {
-            venv::destroy()?;
-        }
-        match venv::create(&py.path) {
-            Ok(()) => return Ok(py),
-            Err(e) => {
-                eprintln!(
-                    "  Warning: Python {}.{} failed to create venv, trying next...",
-                    py.version.0, py.version.1
-                );
-                last_err = Some(e);
-            }
+        searched.push(format!(
+            "{} — Python {}.{}, via {}",
+            py.path.display(),
+            py.version.0,
+            py.version.1,
+            py.source.label()
+        ));
+
+        venv::destroy()?;
+        match venv::create(uv_bin, py.path.as_os_str()) {
+            Ok(()) => return venv_python_info(&py.path.to_string_lossy(), py.source),
+            Err(e) => eprintln!(
+                "  Warning: uv venv failed on {} ({}), trying next...",
+                py.path.display(),
+                summarize(&e)
+            ),
         }
     }
 
-    Err(last_err.unwrap_or_else(|| {
-        Error::VenvCreate("All Python candidates failed to create a virtual environment".into())
-    }))
+    // Nothing on this host worked (or there was nothing here at all) — the
+    // launcher supplies its own interpreter rather than telling the user to go
+    // install one (D1).
+    eprintln!(
+        "  No usable system Python — downloading CPython {} with uv...",
+        uv::PROVISIONED_PYTHON
+    );
+    if let Err(provision) = uv::install_python(uv_bin, uv::PROVISIONED_PYTHON) {
+        return Err(Error::NoPython {
+            searched,
+            provision: Some(provision),
+        });
+    }
+
+    venv::destroy()?;
+    venv::create(uv_bin, std::ffi::OsStr::new(uv::PROVISIONED_PYTHON))?;
+    venv_python_info(uv::PROVISIONED_PYTHON, python::Source::UvManaged)
 }
 
-/// Attempt to create the managed venv using `py`. Returns true on success.
+/// Describe the interpreter the freshly created managed venv actually runs on.
 ///
-/// Destroys any existing venv first, prints progress, and silently returns
-/// false on failure (caller decides whether to warn or move on).
-fn try_venv(py: &python::PythonInfo) -> bool {
-    eprintln!(
-        "  Trying Python {}.{} at {} (has compiled wheel)",
-        py.version.0,
-        py.version.1,
-        py.path.display()
-    );
-    let venv_dir = dirs::venv_dir();
-    if venv_dir.exists() && venv::destroy().is_err() {
-        return false;
-    }
-    match venv::create(&py.path) {
-        Ok(()) => true,
-        Err(_) => {
-            eprintln!(
-                "  Warning: Python {}.{} failed to create venv, trying next...",
-                py.version.0, py.version.1
-            );
-            false
+/// Read back out of the venv rather than assumed: for a uv-provisioned CPython
+/// the launcher never names the interpreter path itself, and for a system
+/// interpreter this confirms the venv is what was asked for instead of trusting
+/// the request. `spec` is what we passed to `uv venv`, used only to attribute an
+/// error.
+fn venv_python_info(spec: &str, source: python::Source) -> Result<python::PythonInfo, Error> {
+    // Every failure below leaves a venv that `uv` created but we rejected. The
+    // `VenvCreate` message tells the user the partial environment was removed,
+    // so it has to actually be removed here too.
+    let reject = |detail: String| -> Error {
+        let _ = venv::destroy();
+        Error::VenvCreate {
+            interpreter: spec.to_string(),
+            detail,
         }
+    };
+
+    let venv_python = dirs::venv_python();
+    let version = python::probe_version(&venv_python).ok_or_else(|| {
+        reject(format!(
+            "uv venv reported success but {} does not report a version",
+            venv_python.display()
+        ))
+    })?;
+    if !python::meets_minimum(version) {
+        return Err(reject(format!(
+            "the new environment runs Python {}.{}, below the required {}.{}",
+            version.0,
+            version.1,
+            python::MIN_PYTHON.0,
+            python::MIN_PYTHON.1
+        )));
     }
+    Ok(python::PythonInfo {
+        // `base-executable` from pyvenv.cfg is the real interpreter behind the
+        // venv; fall back to the venv's own python if a cfg ever omits it.
+        path: venv::base_interpreter().unwrap_or(venv_python),
+        version,
+        source,
+    })
+}
+
+/// One line of an error, for a "trying next..." note where the full multi-line
+/// user-facing message would bury the loop's progress.
+///
+/// uv puts its `error: …` summary last, so the last non-empty line is the
+/// informative one.
+fn summarize(err: &Error) -> String {
+    let detail = match err {
+        Error::VenvCreate { detail, .. } => detail.clone(),
+        other => other.to_string(),
+    };
+    detail
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("no output")
+        .to_string()
 }
 
 /// Download and install a compiled wheel from an already-fetched `CliRelease`.
