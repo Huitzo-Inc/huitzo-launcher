@@ -18,8 +18,8 @@ code cannot silently diverge.
 
 | Platform | Shells | One-command bootstrap | Notes |
 |----------|--------|-----------------------|-------|
-| **macOS** (Apple Silicon + Intel) | `zsh`, `bash`, `fish` | `curl -sSf https://huitzo.ai/install.sh \| sh` | Primary target. |
-| **Linux** (glibc + musl, x86_64 + aarch64) | `bash`, `zsh`, `fish` | `curl -sSf https://huitzo.ai/install.sh \| sh` | Primary target. |
+| **macOS** (Apple Silicon only) | `zsh`, `bash`, `fish` | `curl -sSf https://raw.githubusercontent.com/Huitzo-Inc/huitzo-launcher/main/install.sh \| sh` | Primary target. Intel macOS (`x86_64`) is **unsupported** — no `macos-x86_64` CLI wheel is published; the launcher refuses rather than falling through to an unusable install. |
+| **Linux** (glibc + musl, x86_64 + aarch64) | `bash`, `zsh`, `fish` | `curl -sSf https://raw.githubusercontent.com/Huitzo-Inc/huitzo-launcher/main/install.sh \| sh` | Primary target. |
 | **WSL2** (Windows Subsystem for Linux, Ubuntu) | `bash`, `zsh` | run the Linux command **inside** the WSL distro | Treated as Linux. The launcher detects WSL and classifies it `supported`. |
 
 A machine in the supported set with all three required tools present
@@ -72,6 +72,12 @@ on such machines are told up front.
 - A required tool gap (`huitzo` / `claude` / `git` missing) is reported with a
   copy-paste install hint, and the command exits non-zero so a script can
   branch on readiness.
+- **The exit code reflects required-tool presence only, not `host.support`.**
+  A tooled native-Windows host (all of `huitzo`/`claude`/`git` present) exits
+  `0` even though it prints `host.support: unsupported` — the runner-pairing
+  gap is visible only in the JSON/human report, never in the exit code. A
+  script that needs to gate on runner eligibility, not just tool presence,
+  must inspect `host.support` itself.
 - Distribution-integrity verification of downloaded binaries beyond the
   existing SHA-256 checksum (install scripts) and the Ed25519 signed
   capability/bundle trust root (launcher) is the scope of **S57** and is not
