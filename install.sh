@@ -25,6 +25,15 @@
 set -eu
 
 REPO="Huitzo-Inc/huitzo-launcher"
+
+# Remember whether the caller pointed us somewhere other than the default home
+# BEFORE we apply the default: a sandboxed/alternate install must not reason
+# about — let alone mutate — the machine-wide Python environment.
+if [ -n "${HUITZO_HOME:-}" ]; then
+    HUITZO_HOME_IS_OVERRIDE=1
+else
+    HUITZO_HOME_IS_OVERRIDE=0
+fi
 HUITZO_HOME="${HUITZO_HOME:-$HOME/.huitzo}"
 INSTALL_DIR="$HUITZO_HOME/bin"
 VENV_DIR="$HUITZO_HOME/venv"
@@ -167,17 +176,27 @@ clean_conflicts() {
         rm -rf "$CACHE_DIR"
     fi
 
-    # Remove any conflicting pip-installed huitzo
+    # A pip-installed "huitzo" can shadow the launcher on PATH, so we REPORT it.
+    # We do not uninstall it: the user's global Python is not ours to mutate, and
+    # a silent `pip uninstall` during a bootstrap is exactly the kind of implicit
+    # side effect this installer must not have. When HUITZO_HOME points somewhere
+    # other than the default, the machine-wide interpreter is not even in scope.
+    if [ "$HUITZO_HOME_IS_OVERRIDE" = "1" ]; then
+        return 0
+    fi
+
     for pip_cmd in pip3 pip; do
         if command -v "$pip_cmd" > /dev/null 2>&1; then
             if "$pip_cmd" show huitzo > /dev/null 2>&1; then
-                echo "  Removing conflicting pip-installed huitzo..."
-                "$pip_cmd" uninstall huitzo -y --quiet 2>/dev/null || true
-                echo "  Done."
+                echo "  Note: a pip-installed 'huitzo' exists in $pip_cmd's environment."
+                echo "        It may shadow $INSTALL_DIR/huitzo on your PATH. Remove it with:"
+                echo "          $pip_cmd uninstall huitzo"
             fi
             break
         fi
     done
+
+    return 0
 }
 
 download_and_verify() {
@@ -188,27 +207,41 @@ download_and_verify() {
     echo "  Downloading $ASSET..."
     curl -sSfL "$DOWNLOAD_URL" -o "$TMPBIN"
 
-    if [ -n "${SHA256_URL:-}" ]; then
-        echo "  Verifying checksum..."
-        EXPECTED=$(curl -sSfL "$SHA256_URL" | awk '{print $1}')
-
-        if command -v sha256sum > /dev/null 2>&1; then
-            ACTUAL=$(sha256sum "$TMPBIN" | awk '{print $1}')
-        elif command -v shasum > /dev/null 2>&1; then
-            ACTUAL=$(shasum -a 256 "$TMPBIN" | awk '{print $1}')
-        else
-            echo "  Warning: No sha256 tool found, skipping verification."
-            ACTUAL="$EXPECTED"
-        fi
-
-        if [ "$ACTUAL" != "$EXPECTED" ]; then
-            echo "Error: Checksum mismatch — download may be corrupted."
-            echo "  Expected: $EXPECTED"
-            echo "  Got:      $ACTUAL"
-            exit 1
-        fi
-        echo "  Checksum OK"
+    # Verification is unconditional. Every path out of this block either has a
+    # real, matching SHA-256 or exits non-zero: an installer that "verifies"
+    # by assuming success is worse than one that never claimed to.
+    echo "  Verifying checksum..."
+    EXPECTED=$(curl -sSfL "$SHA256_URL" | awk '{print $1}' | tr 'A-F' 'a-f')
+    # Anything that is not a 64-char hex digest (empty body, an error page, a
+    # truncated fetch) is a verification failure, not something to compare against.
+    if ! printf '%s' "$EXPECTED" | grep -Eq '^[0-9a-f]{64}$'; then
+        echo "Error: Published checksum for $ASSET is missing or not a SHA-256 digest."
+        echo "  Refusing to install an unverified binary."
+        echo "  Checksum URL: $SHA256_URL"
+        exit 1
     fi
+
+    if command -v sha256sum > /dev/null 2>&1; then
+        ACTUAL=$(sha256sum "$TMPBIN" | awk '{print $1}' | tr 'A-F' 'a-f')
+    elif command -v shasum > /dev/null 2>&1; then
+        ACTUAL=$(shasum -a 256 "$TMPBIN" | awk '{print $1}' | tr 'A-F' 'a-f')
+    elif command -v openssl > /dev/null 2>&1; then
+        # openssl 3.x prints "SHA2-256(file)= <hex>", openssl 1.x "SHA256(file)= <hex>"
+        ACTUAL=$(openssl dgst -sha256 "$TMPBIN" | awk '{print $NF}' | tr 'A-F' 'a-f')
+    else
+        echo "Error: No SHA-256 tool found (tried sha256sum, shasum, openssl)."
+        echo "  Refusing to install an unverified binary. Install one of them"
+        echo "  (e.g. coreutils, perl, or openssl) and re-run this installer."
+        exit 1
+    fi
+
+    if [ "$ACTUAL" != "$EXPECTED" ]; then
+        echo "Error: Checksum mismatch — download may be corrupted."
+        echo "  Expected: $EXPECTED"
+        echo "  Got:      $ACTUAL"
+        exit 1
+    fi
+    echo "  Checksum OK"
 
     chmod +x "$TMPBIN"
     VERIFIED_BIN="$TMPBIN"
