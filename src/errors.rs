@@ -37,8 +37,19 @@ pub enum FeedError {
     },
     /// Any other non-200 status from the feed host.
     Status(u16),
-    /// The request never completed: DNS, TCP, TLS, proxy, or timeout.
+    /// The request never completed: DNS, TCP, proxy, or timeout.
     Unreachable(String),
+    /// The TLS handshake itself failed (m15).
+    ///
+    /// Split out of [`FeedError::Unreachable`] because it is the one network
+    /// failure the user can usually fix themselves and the only one whose
+    /// remedy is a setting rather than a wait: the launcher trusts the CA list
+    /// compiled into it, not the machine's store, so a TLS-intercepting
+    /// corporate proxy fails here until `HUITZO_CA_BUNDLE` names its root.
+    /// `detail` carries the proxy/CA settings that were in effect, captured at
+    /// construction — reading them again at render time would report the
+    /// environment of whoever prints the error, not of the request that failed.
+    Tls(String),
     /// The feed answered, but not with something the launcher can parse.
     Malformed(String),
 }
@@ -88,7 +99,15 @@ pub enum Error {
     /// else to try (D5 — the PyPI fallback is gone, not flag-gated).
     NoWheel {
         platform: String,
-        python_version: (u8, u8),
+        /// The interpreter the wheel was being chosen for, when one is known.
+        ///
+        /// `None` is a real state, not a placeholder: `--update` parses this
+        /// out of the local manifest and a corrupt `python_version` there
+        /// leaves the launcher with no interpreter to name (R61). It used to
+        /// be flattened to `(0, 0)` and rendered as "Python 0.0", which is a
+        /// version that has never existed — the message said something false
+        /// about the user's machine.
+        python_version: Option<(u8, u8)>,
         feed_version: String,
         available: Vec<String>,
     },
@@ -112,6 +131,20 @@ pub enum Error {
     },
     /// HTTP request failed (PyPI, GitHub).
     Network(String),
+    /// A proxy environment variable is set to something unusable (m15).
+    ///
+    /// Terminal for the same reason as [`Error::CaBundle`]: the alternative is
+    /// connecting direct, which on a machine where the proxy is the only route
+    /// out fails later and somewhere less obvious — and on a machine where it
+    /// is not, quietly bypasses the egress path the admin configured.
+    ProxyConfig { var: String, value: String },
+    /// `HUITZO_CA_BUNDLE` is set but does not yield usable trust anchors (m15).
+    ///
+    /// Terminal rather than a fall back to the bundled roots: a user who
+    /// pointed the launcher at a CA file did so because the bundled roots do
+    /// not work here, so silently ignoring the file would turn a typo into the
+    /// TLS failure they were trying to fix.
+    CaBundle { path: String, detail: String },
     /// manifest.json read/write failed.
     Manifest(String),
     /// Self-update failed.
@@ -280,7 +313,10 @@ impl fmt::Display for Error {
                 feed_version,
                 available,
             } => {
-                let (major, minor) = python_version;
+                let interpreter = match python_version {
+                    Some((major, minor)) => format!("Python {major}.{minor}"),
+                    None => "unknown (the local manifest does not record a usable one)".to_string(),
+                };
                 // The subset that would work here if the user had that
                 // interpreter — the difference between "unsupported machine"
                 // and "wrong Python", which is the actionable part.
@@ -309,7 +345,7 @@ impl fmt::Display for Error {
                     f,
                     "No Huitzo CLI wheel matches this machine, so nothing was installed.\n\n\
                      \x20 Platform key:  {platform}\n\
-                     \x20 Interpreter:   Python {major}.{minor}\n\
+                     \x20 Interpreter:   {interpreter}\n\
                      \x20 Release:       cli-v{feed_version}\n\
                      \x20 Feed offers:\n{available}\n\n{}\
                      Report a platform you expected to see at\n\
@@ -367,6 +403,24 @@ impl fmt::Display for Error {
                  \x20 {remedy}"
             ),
             Error::Network(detail) => write!(f, "Network error: {detail}"),
+            Error::ProxyConfig { var, value } => write!(
+                f,
+                "{var} is set to a value the launcher cannot use as a proxy.\n\n\
+                 \x20 {var}={value}\n\n\
+                 Expected `host:port`, or a full URL such as `http://proxy.corp:8080`\n\
+                 (`https://`, `socks5://` and `user:password@` are all accepted). The\n\
+                 launcher refuses rather than connecting direct, which would silently\n\
+                 bypass the proxy your network requires. Nothing was installed."
+            ),
+            Error::CaBundle { path, detail } => write!(
+                f,
+                "HUITZO_CA_BUNDLE is set but no certificate could be loaded from it.\n\n\
+                 \x20 Path:   {path}\n\
+                 \x20 Detail: {detail}\n\n\
+                 The file must be PEM (-----BEGIN CERTIFICATE-----), and may hold a chain.\n\
+                 A DER/`.crt` binary file, or a private key on its own, will not do.\n\
+                 Nothing was installed."
+            ),
             Error::Manifest(detail) => write!(f, "Manifest error: {detail}"),
             Error::SelfUpdate(detail) => write!(
                 f,
@@ -462,9 +516,10 @@ impl fmt::Display for FeedError {
             FeedError::Unreachable(detail) => write!(
                 f,
                 "the request never completed: {detail}\n\
-                 \x20   A network, DNS, proxy or TLS problem rather than anything about your\n\
+                 \x20   A network, DNS or proxy problem rather than anything about your\n\
                  \x20   machine's Python."
             ),
+            FeedError::Tls(detail) => write!(f, "the TLS handshake failed: {detail}"),
             FeedError::Malformed(detail) => write!(
                 f,
                 "the feed was unreadable: {detail}\n\
@@ -503,7 +558,11 @@ pub fn exit_code(err: &Error) -> i32 {
         // Install succeeded, artefact is wrong: bad data from the feed (M8).
         Error::InstallVerify { .. } => 65, // EX_DATAERR
         Error::Network(_) => 69,           // EX_UNAVAILABLE
-        Error::Manifest(_) => 66,          // EX_NOINPUT
+        // The host is fine and the network may be too; the launcher was handed
+        // a CA file it cannot read. That is configuration, like NoWheel.
+        Error::CaBundle { .. } => 78,    // EX_CONFIG
+        Error::ProxyConfig { .. } => 78, // EX_CONFIG
+        Error::Manifest(_) => 66,        // EX_NOINPUT
         Error::SelfUpdate(_) => 1,
         Error::Exec(_) => 126,              // Command found but not executable
         Error::TrustViolation { .. } => 77, // EX_NOPERM
@@ -594,7 +653,7 @@ mod tests {
         };
         let no_wheel = Error::NoWheel {
             platform: "linux-x86_64".to_string(),
-            python_version: (3, 11),
+            python_version: Some((3, 11)),
             feed_version: "0.11.1".to_string(),
             available: vec!["linux-x86_64-cp312".to_string()],
         };
