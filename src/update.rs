@@ -7,6 +7,29 @@ use crate::errors::Error;
 use crate::manifest::{self, PendingUpdate};
 use sha2::{Digest, Sha256};
 use std::io::Read;
+use std::path::{Path, PathBuf};
+
+/// How many times a staged update is applied automatically before the launcher
+/// stops trying on its own and waits for an explicit `huitzo --launcher-update`.
+const MAX_AUTO_ATTEMPTS: u32 = 3;
+
+/// How long to wait after a failed attempt before retrying automatically.
+///
+/// Matched to the update-check interval: one retry per day, not one per
+/// invocation (M14).
+const RETRY_AFTER_SECS: u64 = 24 * 60 * 60;
+
+/// How many times the outgoing binary's restore is retried, and the step
+/// between tries, when installing the new one failed.
+///
+/// A restore that does not happen leaves the user with no launcher on PATH, so
+/// it is worth waiting out the transient blockers — an anti-virus scanner
+/// holding the file, a handle not yet released. The permanent ones (a full
+/// disk, an unwritable directory) are already ruled out before anything is
+/// moved, so this loop is bounded at roughly a second and never becomes the
+/// reason a launch hangs.
+const RESTORE_ATTEMPTS: u32 = 5;
+const RESTORE_BACKOFF_MS: u64 = 100;
 
 /// Check if update checking is disabled via environment variable.
 pub fn should_skip() -> bool {
@@ -58,20 +81,23 @@ pub fn background_check() {
     // Homebrew users get launcher updates via `brew upgrade huitzo` instead.
     if !is_homebrew_install() {
         if let Some(latest) = check_launcher_version() {
-            m.pending_update = Some(PendingUpdate {
-                kind: "launcher".to_string(),
-                version: latest,
-            });
+            m.pending_update = Some(stage(m.pending_update.take(), "launcher", latest));
         }
     }
 
-    if m.pending_update.is_none() {
+    // A staged launcher update takes precedence: it is the one that can change
+    // what the CLI update is even allowed to be (see
+    // [`enforce_min_launcher_version`]). Anything else staged is a CLI update,
+    // and re-checking it lets a genuinely newer release replace one that is
+    // stuck — without resetting the attempt count when it is the same release.
+    let launcher_staged = m
+        .pending_update
+        .as_ref()
+        .is_some_and(|p| p.kind == "launcher");
+    if !launcher_staged {
         if let Some(latest) = download::check_cli_release_version() {
             if version_is_newer(&latest, &m.huitzo_version) {
-                m.pending_update = Some(PendingUpdate {
-                    kind: "wheel".to_string(),
-                    version: latest,
-                });
+                m.pending_update = Some(stage(m.pending_update.take(), "wheel", latest));
             }
         }
     }
@@ -142,18 +168,48 @@ pub fn platform_asset_name() -> &'static str {
     }
 }
 
+/// What a self-update attempt actually did.
+///
+/// The distinction is the fix for M13: [`self_update`] used to answer `Ok(())`
+/// to "installed 0.3.3", "already on 0.3.3" and "Homebrew owns this binary, I
+/// did nothing" alike, and the caller wrote `launcher_version = <target>` into
+/// the manifest for all three. A brew user's manifest then claimed a version
+/// they did not have.
+#[derive(Debug, PartialEq, Eq)]
+pub enum UpdateOutcome {
+    /// The binary on disk was replaced. Carries the version now installed —
+    /// the only value a caller may record as `launcher_version`.
+    Updated(String),
+    /// Already running the newest release; nothing was written.
+    AlreadyCurrent,
+    /// Homebrew owns this binary and `brew upgrade huitzo` is the only safe
+    /// way to move it. **Nothing was installed.**
+    DeferredToHomebrew,
+}
+
 /// Self-update the launcher binary from GitHub Releases.
 ///
 /// Filters the releases list for `v*` tags (excludes `cli-v*`) so that a CLI
 /// release published after the latest launcher release does not shadow it.
-/// Verifies integrity and atomically replaces the current binary.
-pub fn self_update() -> Result<(), Error> {
+/// Verifies integrity, then replaces the running binary via
+/// [`replace_running_binary`].
+pub fn self_update() -> Result<UpdateOutcome, Error> {
     let current_version = env!("CARGO_PKG_VERSION");
 
     if is_homebrew_install() {
-        eprintln!("Launcher is managed by Homebrew. Run 'brew upgrade huitzo' to update.");
-        return Ok(());
+        eprintln!(
+            "Launcher is managed by Homebrew — not replacing {}.\n\
+             Run 'brew upgrade huitzo' to update it.",
+            std::env::current_exe()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "the installed binary".to_string())
+        );
+        return Ok(UpdateOutcome::DeferredToHomebrew);
     }
+
+    // The previous image, if an update on this machine left one behind
+    // (Windows cannot delete the binary it is running from).
+    cleanup_replaced_binary();
 
     eprintln!("Checking for launcher updates (current: v{current_version})...");
 
@@ -172,7 +228,7 @@ pub fn self_update() -> Result<(), Error> {
     // 2. Compare versions
     if !version_is_newer(latest_version, current_version) {
         eprintln!("Launcher is up to date (v{current_version}).");
-        return Ok(());
+        return Ok(UpdateOutcome::AlreadyCurrent);
     }
 
     eprintln!("New launcher version available: v{latest_version}");
@@ -193,7 +249,10 @@ pub fn self_update() -> Result<(), Error> {
     std::fs::create_dir_all(&tmp_dir)
         .map_err(|e| Error::SelfUpdate(format!("Failed to create tmp dir: {e}")))?;
 
-    let tmp_binary = tmp_dir.join("huitzo-new");
+    // The suffix is not cosmetic: on Windows an extensionless file is not an
+    // executable image, so the binary must already be `huitzo-new.exe` before
+    // it is moved into place (m13).
+    let tmp_binary = tmp_dir.join(format!("huitzo-new{}", std::env::consts::EXE_SUFFIX));
 
     // 5. Download checksum file
     eprintln!("  Downloading checksum...");
@@ -226,11 +285,310 @@ pub fn self_update() -> Result<(), Error> {
         .map_err(|e| Error::SelfUpdate(format!("Cannot determine current executable: {e}")))?;
 
     eprintln!("  Replacing {}...", current_exe.display());
-    std::fs::rename(&tmp_binary, &current_exe)
-        .map_err(|e| Error::SelfUpdate(format!("Failed to replace binary: {e}")))?;
+    if let Err(e) = replace_running_binary(&tmp_binary, &current_exe) {
+        // Leaving a verified-but-uninstalled binary in tmp would be re-used by
+        // nothing and re-downloaded anyway; drop it so a retry starts clean.
+        let _ = std::fs::remove_file(&tmp_binary);
+        return Err(e);
+    }
 
     eprintln!("Launcher updated to v{latest_version} successfully.");
+    Ok(UpdateOutcome::Updated(latest_version.to_string()))
+}
+
+/// Put `new_binary` in place of the currently running executable.
+///
+/// `std::fs::rename(new, current_exe)` — what this used to do — fails outright
+/// on Windows, which refuses to replace a mapped image: `Access is denied.
+/// (os error 5)`, and the founder's install sat on 0.3.2 because of it (B6).
+///
+/// Windows *does* allow a running image to be **renamed**, so the sequence is:
+/// stage the new binary beside the running one, move the running one aside to
+/// `<exe>.old`, rename the staged file into its place, then delete the old one
+/// — which succeeds immediately on Unix and on the next launch on Windows
+/// ([`cleanup_replaced_binary`]).
+///
+/// Staging into the destination directory *first* is what keeps a half-done
+/// replacement off the user's disk. It is the only step that moves bytes, so
+/// it is where a full disk, an unwritable directory or a scanner refusing the
+/// write surfaces — and it surfaces with the working launcher still exactly
+/// where it was. What is left after it are two same-directory renames: they
+/// need no space, they cannot leave a truncated file behind, and a failed one
+/// is retried ([`restore_with_retry`]) rather than accepted. An out-of-date
+/// launcher is recoverable; a missing one is not.
+fn replace_running_binary(new_binary: &Path, current_exe: &Path) -> Result<(), Error> {
+    let backup = backup_path(current_exe);
+    let staged = staged_path(current_exe);
+    // Windows `rename` never overwrites, so leftovers from an earlier update
+    // would fail the moves below before they started.
+    let _ = std::fs::remove_file(&backup);
+    let _ = std::fs::remove_file(&staged);
+
+    if let Err(e) = move_file(new_binary, &staged) {
+        let _ = std::fs::remove_file(&staged);
+        return Err(Error::SelfUpdate(format!(
+            "Could not write the new binary into {}, so the update was not started \
+             and the launcher at {} is untouched: {e}",
+            current_exe.parent().unwrap_or(current_exe).display(),
+            current_exe.display()
+        )));
+    }
+
+    if let Err(e) = std::fs::rename(current_exe, &backup) {
+        let _ = std::fs::remove_file(&staged);
+        return Err(Error::SelfUpdate(format!(
+            "Failed to move the running binary aside ({} -> {}), so it is untouched: {e}",
+            current_exe.display(),
+            backup.display()
+        )));
+    }
+
+    // A rename either happens or does not: unlike a copy it cannot leave a
+    // truncated image at `current_exe`, so the restore below has a clear path.
+    if let Err(e) = std::fs::rename(&staged, current_exe) {
+        let restored = restore_with_retry(&backup, current_exe);
+        let _ = std::fs::remove_file(&staged);
+        return Err(Error::SelfUpdate(format!(
+            "Failed to install the new binary at {}: {e}{}",
+            current_exe.display(),
+            if restored {
+                " (the previous launcher was put back and still works)"
+            } else {
+                // Say it plainly rather than let the next run look like a
+                // mysteriously missing command.
+                " — and the previous launcher could not be restored; it is at the .old path beside it"
+            }
+        )));
+    }
+
+    // Unix unlinks it here; Windows still has the image mapped and refuses,
+    // which is what `cleanup_replaced_binary` is for.
+    let _ = std::fs::remove_file(&backup);
     Ok(())
+}
+
+/// Put the outgoing binary back after a failed install, retrying briefly.
+///
+/// The blockers that can still reach this point are transient by construction
+/// — the permanent ones failed the staging step before anything moved — and a
+/// launcher that exists is worth a second of backoff. Returns whether the
+/// binary is back in place; the caller reports the outcome either way, and
+/// only ever from this return value: a `current_exe` that merely *exists*
+/// could be the half-installed image, which is not a working launcher.
+fn restore_with_retry(backup: &Path, current_exe: &Path) -> bool {
+    for attempt in 0..RESTORE_ATTEMPTS {
+        if std::fs::rename(backup, current_exe).is_ok() {
+            return true;
+        }
+        if attempt + 1 < RESTORE_ATTEMPTS {
+            std::thread::sleep(std::time::Duration::from_millis(
+                RESTORE_BACKOFF_MS * u64::from(attempt + 1),
+            ));
+        }
+    }
+    false
+}
+
+/// Where the outgoing binary is parked during a replacement: `<exe>.old`
+/// (`huitzo.exe.old` on Windows, `huitzo.old` elsewhere).
+fn backup_path(current_exe: &Path) -> PathBuf {
+    let mut name = current_exe.as_os_str().to_os_string();
+    name.push(".old");
+    PathBuf::from(name)
+}
+
+/// Where the incoming binary is written before the swap: `<exe>.new`, in the
+/// install directory on purpose — see [`replace_running_binary`]. Neither
+/// suffix is executable by PATH lookup, so a leftover can never be run in
+/// place of the real launcher.
+fn staged_path(current_exe: &Path) -> PathBuf {
+    let mut name = current_exe.as_os_str().to_os_string();
+    name.push(".new");
+    PathBuf::from(name)
+}
+
+/// Delete the previous binary left behind by an update on this machine.
+///
+/// Called at the start of every self-update and once per launch from the
+/// pending-update path. On Windows the `.old` file cannot be deleted by the
+/// process that was running from it, so it is always the *next* launch that
+/// clears it.
+pub fn cleanup_replaced_binary() {
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = std::fs::remove_file(backup_path(&exe));
+        // A staged binary from an update that died mid-swap is dead weight:
+        // the next update writes its own. Left alone it would accumulate one
+        // copy of the launcher per failed attempt.
+        let _ = std::fs::remove_file(staged_path(&exe));
+    }
+}
+
+/// Move `from` to `to`, falling back to copy + delete when `rename` cannot
+/// cross the boundary between them.
+///
+/// `$HUITZO_HOME/tmp` and the installed binary are routinely on different
+/// filesystems — a `/tmp`-backed `HUITZO_HOME`, a container bind mount, a
+/// Windows install on a different drive from the download directory — and
+/// `rename` answers `EXDEV` there (m13). A failure the copy shares (no
+/// permission on the destination, no space) still surfaces: the copy reports
+/// it.
+fn move_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    match std::fs::rename(from, to) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            // `copy` carries the Unix mode bits across, so the 0o755 set on the
+            // download survives the fallback.
+            std::fs::copy(from, to)?;
+            let _ = std::fs::remove_file(from);
+            Ok(())
+        }
+    }
+}
+
+/// Stage `kind`/`version` as the pending update, carrying an existing failure
+/// record forward when it is the same update that is already staged.
+///
+/// Without this the daily check would zero the attempt counter and the bounded
+/// retry would never be bounded — the loop M14 describes, just one day long.
+fn stage(existing: Option<PendingUpdate>, kind: &str, version: String) -> PendingUpdate {
+    match existing {
+        Some(p) if p.kind == kind && p.version == version => p,
+        _ => PendingUpdate {
+            kind: kind.to_string(),
+            version,
+            attempts: 0,
+            last_attempt: 0,
+            last_error: None,
+        },
+    }
+}
+
+/// Whether a staged update should be applied automatically on this launch.
+///
+/// First attempt: always. After a failure: not again until `RETRY_AFTER_SECS`
+/// has passed, and never more than `MAX_AUTO_ATTEMPTS` times in total. An
+/// explicit `huitzo --launcher-update` does not come through here — a user who
+/// asks for a retry gets one.
+pub fn should_attempt(pending: &PendingUpdate, now: u64) -> bool {
+    if pending.attempts == 0 {
+        return true;
+    }
+    pending.attempts < MAX_AUTO_ATTEMPTS
+        && now.saturating_sub(pending.last_attempt) >= RETRY_AFTER_SECS
+}
+
+/// The line printed when an update is staged but not attempted.
+///
+/// Silence here would be the other half of the M14 bug: the launcher would
+/// simply stop updating with no way for the user to find out why. The message
+/// names the failure and the command that retries it.
+pub fn deferral_notice(pending: &PendingUpdate) -> String {
+    let what = if pending.kind == "launcher" {
+        format!("launcher update to v{}", pending.version)
+    } else {
+        format!("huitzo update to {}", pending.version)
+    };
+    let cause = pending
+        .last_error
+        .as_deref()
+        .filter(|e| !e.is_empty())
+        .map(|e| format!(" (last error: {e})"))
+        .unwrap_or_default();
+    let plural = if pending.attempts == 1 { "" } else { "s" };
+    format!(
+        "huitzo: {what} deferred after {} failed attempt{plural}{cause}. \
+         Retry with '{}'.",
+        pending.attempts,
+        if pending.kind == "launcher" {
+            upgrade_instruction()
+        } else {
+            "huitzo --launcher-bootstrap".to_string()
+        }
+    )
+}
+
+/// Record a failed attempt against the staged update so the next launch does
+/// not repeat it immediately (M14).
+///
+/// Only the record that actually failed is touched: a check that ran in
+/// between may have staged a different one, and charging that one for this
+/// failure would be a lie in the manifest.
+pub fn record_failed_attempt(kind: &str, version: &str, error: &str) {
+    let Some(mut m) = manifest::load() else {
+        return;
+    };
+    match m.pending_update {
+        Some(ref mut p) if p.kind == kind && p.version == version => {
+            p.attempts = p.attempts.saturating_add(1);
+            p.last_attempt = manifest::now_secs();
+            p.last_error = Some(summarize(error));
+        }
+        _ => return,
+    }
+    let _ = manifest::save(&m);
+}
+
+/// Clear the staged update, recording a new `launcher_version` only when one
+/// was actually installed.
+///
+/// `installed_launcher_version` is `None` for every outcome that did not write
+/// a binary — including the Homebrew deferral (M13).
+pub fn settle_pending(installed_launcher_version: Option<&str>) {
+    let Some(mut m) = manifest::load() else {
+        return;
+    };
+    m.pending_update = None;
+    if let Some(version) = installed_launcher_version {
+        m.launcher_version = version.to_string();
+    }
+    let _ = manifest::save(&m);
+}
+
+/// First line of an error, bounded, for storage in the manifest.
+fn summarize(error: &str) -> String {
+    let line = error.lines().next().unwrap_or_default().trim();
+    if line.chars().count() > 200 {
+        line.chars().take(197).chain("...".chars()).collect()
+    } else {
+        line.to_string()
+    }
+}
+
+/// Refuse to install from a CLI release that requires a newer launcher (M10).
+///
+/// The feed publishes `min_launcher_version` so a CLI build that depends on
+/// launcher behaviour — an exec contract, a manifest field, a bundle layout —
+/// is never installed under a launcher that lacks it. Until now the floor was
+/// parsed and dropped (`download.rs` carried it behind `#[allow(dead_code)]`),
+/// which made it documentation rather than a control.
+///
+/// A floor this launcher cannot parse (`""`, `"latest"`) compares as not-newer
+/// and is allowed through: a malformed field in the feed must not brick every
+/// install, and the wheel is still SHA-256 verified either way.
+pub fn enforce_min_launcher_version(release: &download::CliRelease) -> Result<(), Error> {
+    let current = env!("CARGO_PKG_VERSION");
+    if !version_is_newer(&release.min_launcher_version, current) {
+        return Ok(());
+    }
+    Err(Error::LauncherTooOld {
+        launcher: current.to_string(),
+        required: release.min_launcher_version.clone(),
+        feed_version: release.version.clone(),
+        remedy: upgrade_instruction(),
+    })
+}
+
+/// The command that updates *this* installation's launcher.
+///
+/// A Homebrew install must never be told to run `huitzo --launcher-update`:
+/// that path deliberately refuses to touch a Cellar binary, so the advice
+/// would be a dead end.
+pub fn upgrade_instruction() -> String {
+    if is_homebrew_install() {
+        "brew upgrade huitzo".to_string()
+    } else {
+        "huitzo --launcher-update".to_string()
+    }
 }
 
 /// Find the full release JSON object for the latest launcher release.
@@ -722,6 +1080,391 @@ mod tests {
             Some("0.10.1"),
             "a suffixed tag must not be ranked as the truncated version it parses to"
         );
+    }
+
+    // --- B6 / m13: replacing a binary that is currently running -----------
+
+    fn write(path: &std::path::Path, contents: &str) {
+        std::fs::write(path, contents).unwrap();
+    }
+
+    #[test]
+    fn backup_path_appends_old_to_the_whole_file_name() {
+        // `.exe.old`, not `.old` replacing `.exe`: `with_extension` would have
+        // produced `huitzo.old`, which on Windows is not the image we renamed.
+        assert_eq!(
+            backup_path(std::path::Path::new("/opt/huitzo/bin/huitzo.exe")),
+            std::path::PathBuf::from("/opt/huitzo/bin/huitzo.exe.old")
+        );
+        assert_eq!(
+            backup_path(std::path::Path::new("/usr/local/bin/huitzo")),
+            std::path::PathBuf::from("/usr/local/bin/huitzo.old")
+        );
+    }
+
+    #[test]
+    fn replacing_the_running_binary_installs_the_new_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir
+            .path()
+            .join(format!("huitzo{}", std::env::consts::EXE_SUFFIX));
+        let new = dir.path().join("huitzo-new");
+        write(&exe, "old binary");
+        write(&new, "new binary");
+
+        replace_running_binary(&new, &exe).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&exe).unwrap(), "new binary");
+        assert!(!new.exists(), "the staged binary should have been consumed");
+        assert!(
+            !backup_path(&exe).exists(),
+            "the outgoing binary is unlinked here on Unix"
+        );
+        assert!(
+            !staged_path(&exe).exists(),
+            "the staging file is consumed by the swap"
+        );
+    }
+
+    #[test]
+    fn replacing_over_a_leftover_backup_succeeds() {
+        // Windows `rename` refuses to overwrite, so a `.old` left by an
+        // earlier update would block the move-aside if it were not cleared.
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("huitzo");
+        let new = dir.path().join("huitzo-new");
+        write(&exe, "v2");
+        write(&backup_path(&exe), "v1");
+        // And a staged file from an update that died mid-swap.
+        write(&staged_path(&exe), "half a binary");
+        write(&new, "v3");
+
+        replace_running_binary(&new, &exe).unwrap();
+        assert_eq!(std::fs::read_to_string(&exe).unwrap(), "v3");
+    }
+
+    #[test]
+    fn a_failed_replacement_never_touches_the_installed_binary() {
+        // The half-done state — running image moved aside, new one not
+        // installed — must never be what the user is left with. A new binary
+        // that cannot be staged fails before anything is moved.
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("huitzo");
+        write(&exe, "old binary");
+        let missing = dir.path().join("does-not-exist");
+
+        let err = replace_running_binary(&missing, &exe).unwrap_err();
+        assert!(
+            format!("{err}").contains("untouched"),
+            "unexpected message: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&exe).unwrap(),
+            "old binary",
+            "an out-of-date launcher is recoverable; a missing one is not"
+        );
+        assert!(
+            !backup_path(&exe).exists(),
+            "nothing should have been moved aside"
+        );
+        assert!(
+            !staged_path(&exe).exists(),
+            "the staging file must be cleaned up"
+        );
+    }
+
+    /// The brick the review reproduced: a destination directory that cannot be
+    /// written used to fail *after* the running binary had been moved aside,
+    /// and the restore failed for the same reason, leaving no launcher at all.
+    /// Staging first turns that into an update that simply did not happen.
+    #[test]
+    #[cfg(unix)]
+    fn an_unwritable_destination_leaves_the_launcher_in_place() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("huitzo");
+        write(&exe, "old binary");
+        let new = dir.path().join("huitzo-new");
+        write(&new, "new binary");
+
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        // Root ignores the permission bits this test's premise rests on, so
+        // probe the directory rather than the uid: if it is still writable
+        // there is nothing here to assert.
+        let probe = dir.path().join(".probe");
+        if std::fs::write(&probe, "x").is_ok() {
+            let _ = std::fs::remove_file(&probe);
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+
+        let err = replace_running_binary(&new, &exe).unwrap_err();
+
+        // Restore permissions before asserting so a failure still cleans up.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            format!("{err}").contains("untouched"),
+            "the user must be told the update did not start: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&exe).unwrap(),
+            "old binary",
+            "the working launcher must still be exactly where it was"
+        );
+        assert!(
+            !backup_path(&exe).exists(),
+            "the running binary must not have been moved aside"
+        );
+    }
+
+    /// Same guarantee without depending on permission bits at all: something
+    /// occupying the staged path that cannot be overwritten fails the
+    /// pre-flight, and the installed binary is never disturbed.
+    #[test]
+    fn a_blocked_staging_path_leaves_the_launcher_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("huitzo");
+        write(&exe, "old binary");
+        let new = dir.path().join("huitzo-new");
+        write(&new, "new binary");
+        // A directory cannot be replaced by `rename` or written by `copy`,
+        // whatever the uid.
+        std::fs::create_dir(staged_path(&exe)).unwrap();
+
+        let err = replace_running_binary(&new, &exe).unwrap_err();
+        assert!(format!("{err}").contains("untouched"), "{err}");
+        assert_eq!(std::fs::read_to_string(&exe).unwrap(), "old binary");
+        assert!(!backup_path(&exe).exists());
+    }
+
+    #[test]
+    fn the_restore_puts_the_outgoing_binary_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("huitzo");
+        let backup = backup_path(&exe);
+        write(&backup, "old binary");
+
+        assert!(restore_with_retry(&backup, &exe));
+        assert_eq!(std::fs::read_to_string(&exe).unwrap(), "old binary");
+        assert!(!backup.exists());
+    }
+
+    #[test]
+    fn the_restore_gives_up_instead_of_spinning() {
+        // A restore that genuinely cannot succeed must terminate — the caller
+        // reports the `.old` path so the user can recover by hand.
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("huitzo");
+        let absent = backup_path(&exe);
+
+        let started = std::time::Instant::now();
+        assert!(!restore_with_retry(&absent, &exe));
+        assert!(
+            !exe.exists(),
+            "nothing was restored, and nothing was invented"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the backoff must stay bounded"
+        );
+    }
+
+    /// The EXDEV case (m13) with a real filesystem boundary: `/dev/shm` and
+    /// the tempdir are always separate mounts on Linux, so `rename` between
+    /// them genuinely fails and the copy fallback is what completes the move.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn moving_a_binary_across_filesystems_falls_back_to_copy() {
+        let shm = std::path::Path::new("/dev/shm");
+        if !shm.is_dir() {
+            return;
+        }
+        let src = shm.join(format!("huitzo-t3-{}", std::process::id()));
+        write(&src, "new binary");
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("huitzo");
+
+        let rename = std::fs::rename(&src, &dest).unwrap_err();
+        assert_eq!(
+            rename.raw_os_error(),
+            Some(18),
+            "expected EXDEV across /dev/shm; got {rename}"
+        );
+
+        move_file(&src, &dest).unwrap();
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "new binary");
+        assert!(!src.exists(), "the source should not be left behind");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_copy_fallback_keeps_the_executable_bit() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        let dest = dir.path().join("dest");
+        write(&src, "binary");
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Force the fallback by leaving `rename` nothing to do differently:
+        // copy directly, which is exactly the branch `move_file` takes.
+        std::fs::copy(&src, &dest).unwrap();
+        let mode = std::fs::metadata(&dest).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o111,
+            0o111,
+            "copied binary is not executable: {mode:o}"
+        );
+    }
+
+    #[test]
+    fn the_staged_binary_carries_the_platform_executable_suffix() {
+        // Windows will not execute an extensionless file, so `huitzo-new`
+        // could not be the thing we move into place (m13).
+        let name = format!("huitzo-new{}", std::env::consts::EXE_SUFFIX);
+        if cfg!(windows) {
+            assert_eq!(name, "huitzo-new.exe");
+        } else {
+            assert_eq!(name, "huitzo-new");
+        }
+    }
+
+    // --- M14: a failed update settles -------------------------------------
+
+    fn pending(kind: &str, version: &str, attempts: u32, last_attempt: u64) -> PendingUpdate {
+        PendingUpdate {
+            kind: kind.to_string(),
+            version: version.to_string(),
+            attempts,
+            last_attempt,
+            last_error: Some("Access is denied. (os error 5)".to_string()),
+        }
+    }
+
+    #[test]
+    fn a_fresh_update_is_attempted_immediately() {
+        let p = pending("launcher", "0.3.3", 0, 0);
+        assert!(should_attempt(&p, 1_000_000));
+    }
+
+    #[test]
+    fn the_invocation_after_a_failure_does_not_retry() {
+        // This is M14 itself: the run right after a failure must not
+        // re-download the same binary.
+        let now = 1_000_000;
+        let p = pending("launcher", "0.3.3", 1, now);
+        assert!(!should_attempt(&p, now));
+        assert!(!should_attempt(&p, now + RETRY_AFTER_SECS - 1));
+        assert!(should_attempt(&p, now + RETRY_AFTER_SECS));
+    }
+
+    #[test]
+    fn automatic_retries_are_bounded() {
+        let now = 1_000_000;
+        let capped = pending("launcher", "0.3.3", MAX_AUTO_ATTEMPTS, now);
+        assert!(
+            !should_attempt(&capped, now + 10 * RETRY_AFTER_SECS),
+            "a permanently failing update must stop retrying on its own"
+        );
+    }
+
+    #[test]
+    fn a_deferral_says_what_failed_and_how_to_retry() {
+        let notice = deferral_notice(&pending("launcher", "0.3.3", 2, 0));
+        assert!(notice.contains("0.3.3"), "{notice}");
+        assert!(notice.contains("2 failed attempts"), "{notice}");
+        assert!(notice.contains("Access is denied"), "{notice}");
+        assert!(notice.contains("--launcher-update"), "{notice}");
+        // Singular reads right too — the common case is one failure.
+        let mut once = pending("launcher", "0.3.3", 1, 0);
+        once.last_error = None;
+        let singular = deferral_notice(&once);
+        assert!(
+            singular.contains("1 failed attempt."),
+            "expected singular phrasing: {singular}"
+        );
+    }
+
+    #[test]
+    fn re_staging_the_same_update_keeps_its_failure_record() {
+        // Otherwise the daily check resets the counter and the bounded retry
+        // is unbounded again.
+        let existing = pending("launcher", "0.3.3", 2, 555);
+        let staged = stage(Some(existing), "launcher", "0.3.3".to_string());
+        assert_eq!(staged.attempts, 2);
+        assert_eq!(staged.last_attempt, 555);
+    }
+
+    #[test]
+    fn staging_a_different_version_starts_a_fresh_record() {
+        let staged = stage(
+            Some(pending("launcher", "0.3.3", 3, 555)),
+            "launcher",
+            "0.3.4".to_string(),
+        );
+        assert_eq!(staged.version, "0.3.4");
+        assert_eq!(staged.attempts, 0);
+        assert!(staged.last_error.is_none());
+
+        let kind_changed = stage(
+            Some(pending("wheel", "0.3.3", 3, 555)),
+            "launcher",
+            "0.3.3".to_string(),
+        );
+        assert_eq!(kind_changed.attempts, 0);
+    }
+
+    #[test]
+    fn a_stored_failure_is_one_bounded_line() {
+        let multiline = "first line\nsecond line";
+        assert_eq!(summarize(multiline), "first line");
+        let long = "x".repeat(500);
+        let stored = summarize(&long);
+        assert_eq!(stored.chars().count(), 200);
+        assert!(stored.ends_with("..."));
+    }
+
+    // --- M10: the release feed's launcher floor ---------------------------
+
+    fn release_with_floor(floor: &str) -> download::CliRelease {
+        download::CliRelease {
+            version: "0.11.1".to_string(),
+            min_launcher_version: floor.to_string(),
+            wheels: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_release_that_requires_a_newer_launcher_is_refused() {
+        let err = enforce_min_launcher_version(&release_with_floor("99.0.0")).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("99.0.0"), "{msg}");
+        assert!(msg.contains(env!("CARGO_PKG_VERSION")), "{msg}");
+        assert!(msg.contains("0.11.1"), "{msg}");
+        assert!(
+            msg.contains("--launcher-update") || msg.contains("brew upgrade"),
+            "the refusal must name a way out: {msg}"
+        );
+        assert_eq!(crate::errors::exit_code(&err), 78);
+    }
+
+    #[test]
+    fn a_release_at_or_below_the_launcher_version_is_allowed() {
+        let current = env!("CARGO_PKG_VERSION");
+        enforce_min_launcher_version(&release_with_floor(current))
+            .expect("a floor equal to this launcher must pass");
+        enforce_min_launcher_version(&release_with_floor("0.1.0"))
+            .expect("an older floor must pass");
+        // The default `parse_manifest` applies when the feed predates the field.
+        enforce_min_launcher_version(&release_with_floor("0.0.1")).unwrap();
+    }
+
+    #[test]
+    fn an_unparseable_floor_does_not_brick_every_install() {
+        for floor in ["", "latest", "not-a-version"] {
+            enforce_min_launcher_version(&release_with_floor(floor))
+                .unwrap_or_else(|e| panic!("floor {floor:?} must not refuse: {e}"));
+        }
     }
 
     #[test]

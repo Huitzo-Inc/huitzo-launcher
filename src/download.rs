@@ -16,7 +16,8 @@ const CLI_RELEASES_URL: &str = "https://api.github.com/repos/Huitzo-Inc/huitzo-l
 #[derive(Debug)]
 pub struct CliRelease {
     pub version: String,
-    #[allow(dead_code)] // Reserved for future version-gating of launcher updates
+    /// Minimum launcher version this release may be installed by; enforced in
+    /// [`fetch_cli_release`] via [`crate::update::enforce_min_launcher_version`].
     pub min_launcher_version: String,
     pub wheels: Vec<WheelInfo>,
 }
@@ -197,7 +198,14 @@ pub fn fetch_cli_release() -> Result<CliRelease, Error> {
     let manifest: serde_json::Value = serde_json::from_str(&manifest_str)
         .map_err(|e| malformed(format!("cli-release.json is not JSON: {e}")))?;
 
-    parse_manifest(&manifest).map_err(malformed)
+    let release = parse_manifest(&manifest).map_err(malformed)?;
+
+    // M10: the floor the feed publishes is enforced here, at the one point
+    // every install, bootstrap and update path passes through. The comparison
+    // itself lives with the rest of the version logic in `update`.
+    crate::update::enforce_min_launcher_version(&release)?;
+
+    Ok(release)
 }
 
 /// Turn a parsed `cli-release.json` body into a [`CliRelease`].
@@ -209,9 +217,9 @@ fn parse_manifest(manifest: &serde_json::Value) -> Result<CliRelease, String> {
         .ok_or("cli-release.json has no `version`")?
         .to_string();
 
-    // Parsed, deliberately not enforced here: gating the launcher on
-    // `min_launcher_version` is T3's. It is carried so that error paths can
-    // quote the release they came from, and so T3 has it without a re-fetch.
+    // Parsed here, enforced by the caller: `parse_manifest` is the shape
+    // contract and stays testable without a launcher-version dependency.
+    // An older feed with no floor is not an error — it predates the field.
     let min_launcher_version = manifest["min_launcher_version"]
         .as_str()
         .unwrap_or("0.1.0")

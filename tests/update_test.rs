@@ -1,7 +1,8 @@
 // Copyright (c) 2026 Huitzo Inc. All rights reserved.
 // SPDX-License-Identifier: LicenseRef-Huitzo-Source-Available
 
-//! End-to-end coverage for release selection (#48).
+//! End-to-end coverage for release selection (#48), the release feed's
+//! launcher floor (M10), and the update bookkeeping in the manifest (M13/M14).
 //!
 //! `fetch_cli_release` used to take the *first* `cli-v*` entry in the GitHub
 //! releases array. Every `cli-v*` release shares one `created_at` (they are
@@ -14,6 +15,10 @@ use std::sync::{Mutex, MutexGuard};
 
 use httpmock::MockServer;
 use huitzo_launcher::download;
+use huitzo_launcher::manifest::{self, Manifest, PendingUpdate};
+use huitzo_launcher::update;
+
+mod common;
 
 /// `HUITZO_RELEASE_URL` is process-global; serialize the tests that set it.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -57,9 +62,14 @@ fn cli_entry(server: &MockServer, version: &str, draft: bool) -> serde_json::Val
 
 /// Serves the `cli-release.json` manifest for one CLI version.
 fn mock_manifest(server: &MockServer, version: &str) {
+    mock_manifest_with_floor(server, version, "0.1.0");
+}
+
+/// Same, with an explicit `min_launcher_version` floor (M10).
+fn mock_manifest_with_floor(server: &MockServer, version: &str, floor: &str) {
     let body = serde_json::json!({
         "version": version,
-        "min_launcher_version": "0.1.0",
+        "min_launcher_version": floor,
         "wheels": {
             "linux-x86_64": {
                 "filename": format!("huitzo_cli-{version}-py3-none-any.whl"),
@@ -208,4 +218,155 @@ fn fetch_cli_release_errors_when_no_cli_release_exists() {
         format!("{err}").contains("cli-v*"),
         "unexpected error message: {err}"
     );
+}
+
+// --- M10: the feed's launcher floor is enforced, not just parsed ----------
+
+/// A release that declares a launcher floor above this launcher must be
+/// refused — with the command that fixes it, not a generic feed error. Before
+/// T3 the field was parsed and dropped (`#[allow(dead_code)]`), so an
+/// out-of-date launcher happily installed a CLI it was never cleared for.
+#[test]
+fn fetch_cli_release_refuses_a_release_that_needs_a_newer_launcher() {
+    let server = MockServer::start();
+    mock_manifest_with_floor(&server, "0.11.1", "99.0.0");
+    mock_releases(
+        &server,
+        serde_json::json!([cli_entry(&server, "0.11.1", false)]),
+    );
+
+    let _env = ReleaseUrl::set(&server.url("/releases"));
+    let err = download::fetch_cli_release().expect_err("the floor must be enforced");
+    let msg = format!("{err}");
+    assert!(msg.contains("99.0.0"), "{msg}");
+    assert!(msg.contains("0.11.1"), "{msg}");
+    assert!(
+        msg.contains("--launcher-update") || msg.contains("brew upgrade"),
+        "the refusal must name the upgrade path: {msg}"
+    );
+}
+
+/// A floor at or below this launcher proceeds exactly as before.
+#[test]
+fn fetch_cli_release_proceeds_when_the_floor_is_satisfied() {
+    let server = MockServer::start();
+    mock_manifest_with_floor(&server, "0.11.1", env!("CARGO_PKG_VERSION"));
+    mock_releases(
+        &server,
+        serde_json::json!([cli_entry(&server, "0.11.1", false)]),
+    );
+
+    let _env = ReleaseUrl::set(&server.url("/releases"));
+    let release = download::fetch_cli_release().expect("a satisfied floor must not refuse");
+    assert_eq!(release.version, "0.11.1");
+}
+
+// --- M13 / M14: what the manifest is allowed to record --------------------
+
+fn write_manifest(pending: Option<PendingUpdate>) {
+    manifest::save(&Manifest {
+        schema_version: 3,
+        python_path: "/usr/bin/python3.13".to_string(),
+        python_version: "3.13".to_string(),
+        huitzo_version: "0.11.0".to_string(),
+        launcher_version: "0.3.2".to_string(),
+        last_update_check: 0,
+        pending_update: pending,
+        created_at: 0,
+        install_source: Some("github_release".to_string()),
+        wheel_platform: Some("linux-x86_64".to_string()),
+        active_deployment: None,
+        capability_cache: None,
+    })
+    .unwrap();
+}
+
+fn staged(kind: &str, version: &str) -> PendingUpdate {
+    PendingUpdate {
+        kind: kind.to_string(),
+        version: version.to_string(),
+        attempts: 0,
+        last_attempt: 0,
+        last_error: None,
+    }
+}
+
+/// M13: settling a deferral (Homebrew, or "already current") must clear the
+/// staged record without moving `launcher_version` — that field may only ever
+/// name a binary that is actually on disk.
+#[test]
+fn settling_without_an_install_leaves_launcher_version_alone() {
+    let _home = common::TempHome::new();
+    write_manifest(Some(staged("launcher", "0.3.3")));
+
+    update::settle_pending(None);
+
+    let m = manifest::load().unwrap();
+    assert!(m.pending_update.is_none(), "the record must settle");
+    assert_eq!(
+        m.launcher_version, "0.3.2",
+        "a Homebrew deferral installs nothing, so the manifest must not claim 0.3.3"
+    );
+}
+
+/// The counterpart: a real install is the one thing that moves the version.
+#[test]
+fn settling_after_an_install_records_the_version_that_was_installed() {
+    let _home = common::TempHome::new();
+    write_manifest(Some(staged("launcher", "0.3.3")));
+
+    update::settle_pending(Some("0.3.3"));
+
+    let m = manifest::load().unwrap();
+    assert!(m.pending_update.is_none());
+    assert_eq!(m.launcher_version, "0.3.3");
+}
+
+/// M14: a failure is recorded against the staged update, and the very next
+/// launch reads that record and declines to try again.
+#[test]
+fn a_recorded_failure_stops_the_next_launch_from_retrying() {
+    let _home = common::TempHome::new();
+    write_manifest(Some(staged("launcher", "0.3.3")));
+
+    update::record_failed_attempt(
+        "launcher",
+        "0.3.3",
+        "Self-update failed: Access is denied. (os error 5)\nsecond line",
+    );
+
+    let m = manifest::load().unwrap();
+    let pending = m
+        .pending_update
+        .expect("the update stays staged for a retry");
+    assert_eq!(pending.attempts, 1);
+    assert!(pending.last_attempt > 0);
+    assert_eq!(
+        pending.last_error.as_deref(),
+        Some("Self-update failed: Access is denied. (os error 5)"),
+        "only the first line is stored"
+    );
+    assert!(
+        !update::should_attempt(&pending, manifest::now_secs()),
+        "the next invocation must not re-download the same binary"
+    );
+    assert!(
+        update::deferral_notice(&pending).contains("Access is denied"),
+        "the deferral must say why"
+    );
+}
+
+/// A failure must be charged to the update that actually failed. If the daily
+/// check staged something else in between, that record is left untouched.
+#[test]
+fn a_failure_is_not_charged_to_a_different_staged_update() {
+    let _home = common::TempHome::new();
+    write_manifest(Some(staged("wheel", "0.12.0")));
+
+    update::record_failed_attempt("launcher", "0.3.3", "boom");
+
+    let pending = manifest::load().unwrap().pending_update.unwrap();
+    assert_eq!(pending.kind, "wheel");
+    assert_eq!(pending.attempts, 0);
+    assert!(pending.last_error.is_none());
 }

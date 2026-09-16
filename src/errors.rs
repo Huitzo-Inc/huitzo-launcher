@@ -80,6 +80,18 @@ pub enum Error {
         feed_version: String,
         available: Vec<String>,
     },
+    /// The release feed requires a newer launcher than the one running (M10).
+    ///
+    /// Distinct from [`Error::NoWheel`]: the feed does carry a wheel for this
+    /// host, but the launcher is too old to be trusted to install and run it.
+    /// The remedy is an upgrade, and `remedy` names the one that fits how this
+    /// launcher was installed.
+    LauncherTooOld {
+        launcher: String,
+        required: String,
+        feed_version: String,
+        remedy: String,
+    },
     /// A wheel installed cleanly but the environment still cannot run the CLI (M8).
     InstallVerify {
         wheel: String,
@@ -272,6 +284,20 @@ impl fmt::Display for Error {
                  https://github.com/Huitzo-Inc/huitzo-launcher/issues",
                 indent(detail)
             ),
+            Error::LauncherTooOld {
+                launcher,
+                required,
+                feed_version,
+                remedy,
+            } => write!(
+                f,
+                "This launcher is too old for the current huitzo release.\n\n\
+                 \x20 Launcher:       {launcher}\n\
+                 \x20 Required:       {required} or newer\n\
+                 \x20 huitzo release: {feed_version}\n\n\
+                 Update the launcher, then run huitzo again:\n\
+                 \x20 {remedy}"
+            ),
             Error::Network(detail) => write!(f, "Network error: {detail}"),
             Error::Manifest(detail) => write!(f, "Manifest error: {detail}"),
             Error::SelfUpdate(detail) => write!(
@@ -400,6 +426,9 @@ pub fn exit_code(err: &Error) -> i32 {
         // a configuration fact the user can act on, distinct from a 69 outage
         // that is worth retrying verbatim.
         Error::NoWheel { .. } => 78, // EX_CONFIG
+        // The host is fine, the launcher is stale: the user fixes it by
+        // upgrading, exactly like NoWheel is fixed by changing platform (M10).
+        Error::LauncherTooOld { .. } => 78, // EX_CONFIG
         // Install succeeded, artefact is wrong: bad data from the feed (M8).
         Error::InstallVerify { .. } => 65, // EX_DATAERR
         Error::Network(_) => 69,           // EX_UNAVAILABLE
