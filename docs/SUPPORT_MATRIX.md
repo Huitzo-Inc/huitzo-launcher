@@ -11,9 +11,10 @@ hitting the activation floor **on this supported matrix** — not on covering
 every environment.
 
 The in-launcher capability prober (`huitzo --launcher-detect`) reports the
-host's classification using the rules below. The prober classifies on OS
-family only; the **install** path is stricter and is the authority on what can
-actually be installed — see the `Known gap` note under *Classification rules*.
+host's classification using the rules below. The prober and the install path
+share one platform resolver (`download::current_platform`), so a host the
+installer refuses is reported `unsupported` — in the installer's own wording —
+rather than being classified on OS family alone.
 
 ## Officially supported
 
@@ -60,17 +61,16 @@ reason that spells this out.
 
 `huitzo --launcher-detect` emits `host.support` as one of:
 
-- `supported` — macOS, Linux, or WSL2 (ready to pair a runner).
-- `unsupported` — native Windows (the CLI runs, but the Studio runner needs
-  WSL2; the `unsupported_reason` says exactly that), or any OS not in the
-  supported set.
-
-> **Known gap:** the prober classifies on OS family alone, so it still reports
-> `supported` on Intel macOS and on musl/Alpine. The *install* path refuses
-> both (`install.sh` `detect_platform`, and `Error::UnsupportedPlatform` in the
-> launcher), so no such host can complete an install — but the report is
-> optimistic. Teaching `prober.rs` the libc and macOS-arch distinctions is
-> tracked separately.
+- `supported` — macOS (Apple Silicon), glibc Linux, or WSL2 (ready to pair a
+  runner).
+- `unsupported` — in precedence order:
+  1. **A host the installer refuses**: Intel macOS (D2), musl/Alpine (D8),
+     Windows on ARM, or any unrecognised OS/arch. The prober calls the same
+     `download::current_platform()` the bootstrap calls before it downloads
+     anything, and `unsupported_reason` is that refusal's own rendered text —
+     one wording per decision, so the report and the installer cannot drift.
+  2. **Native Windows (non-WSL)**: the CLI runs, but the Studio runner needs
+     WSL2; the `unsupported_reason` says exactly that.
 
 Corporate-lock is **not** auto-detected (it is not reliably observable from
 the process); it is documented here and surfaced in onboarding copy so users

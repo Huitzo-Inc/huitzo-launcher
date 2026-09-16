@@ -67,6 +67,39 @@ fn host_support_is_supported_on_this_unix_runner() {
 }
 
 #[test]
+fn the_payload_the_hub_consumes_carries_no_terminal_control_codes() {
+    // M5: `huitzo --version` colourises its banner even through a pipe, so the
+    // report shipped a `version` full of ANSI escapes (and the tool's own name)
+    // to the Hub onboarding rail, while `claude` and `git` came back as bare
+    // versions. The contract is one shape: a version, nothing else.
+    let report = prober::probe();
+    let json = serde_json::to_string(&report).expect("serialize");
+
+    // Both forms: a raw escape byte, and serde's JSON escape of one.
+    assert_eq!(json.matches('\u{1b}').count(), 0, "raw escape in payload");
+    assert_eq!(json.matches("\\u001b").count(), 0, "escaped ESC in payload");
+
+    for t in &report.tools {
+        let Some(version) = &t.version else { continue };
+        assert!(
+            !version.chars().any(char::is_control),
+            "{}: control character in {version:?}",
+            t.id
+        );
+        assert!(
+            !version.to_ascii_lowercase().contains(&t.id),
+            "{}: tool-name prefix in {version:?}",
+            t.id
+        );
+        assert!(
+            version.starts_with(|c: char| c.is_ascii_digit()),
+            "{}: not a bare version: {version:?}",
+            t.id
+        );
+    }
+}
+
+#[test]
 fn ready_matches_missing_required_emptiness() {
     let report = prober::probe();
     // Internal consistency: ready() iff there are no missing required tools.

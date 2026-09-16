@@ -528,6 +528,8 @@ fn bootstrap() -> Result<(), Error> {
     // Check for conflicting pip-installed huitzo
     warn_pip_conflict();
 
+    let provenance = install_provenance(wheel);
+
     manifest::save(&Manifest {
         schema_version: 3,
         python_path: py_used.path.to_string_lossy().to_string(),
@@ -537,11 +539,8 @@ fn bootstrap() -> Result<(), Error> {
         last_update_check: 0, // Force update check on next run
         pending_update: None,
         created_at: manifest::now_secs(),
-        // Wheel-from-release-feed is the only install path there is now, and
-        // the key comes from the wheel actually installed rather than from
-        // re-parsing whatever `.whl` happens to be left in the cache dir.
-        install_source: Some("github_release".to_string()),
-        wheel_platform: Some(wheel.platform_key.clone()),
+        install_source: Some(provenance.install_source),
+        wheel_platform: Some(provenance.wheel_platform),
         active_deployment: None,
         capability_cache: None,
     })?;
@@ -684,6 +683,35 @@ fn summarize(err: &Error) -> String {
         .to_string()
 }
 
+/// What the manifest records about where the installed CLI came from.
+///
+/// Feeds the version-drift / currency checks in release tooling, so a wrong
+/// value does not just look untidy — it tells the tooling a machine is on a
+/// release it is not on.
+struct Provenance {
+    /// How huitzo was installed. Wheel-from-release-feed is the only install
+    /// path there is (the PyPI fallback was deleted in T2), so this is
+    /// `github_release` — asserted by a test rather than left implicit.
+    install_source: String,
+    /// The release-feed platform key of the wheel that was installed.
+    wheel_platform: String,
+}
+
+/// Derive the manifest provenance from the wheel that was actually installed.
+///
+/// M9: the deleted `detect_install_source()` globbed `<huitzo_home>/cache` for
+/// a `.whl` and inferred the source from whichever file happened to be lying
+/// there — so a wheel left over from an earlier release, or from an install
+/// that failed, dictated the provenance of an install it had nothing to do
+/// with. This is a pure function of the `WheelInfo` the installer returned:
+/// the cache directory is not consulted, and cannot be.
+fn install_provenance(wheel: &download::WheelInfo) -> Provenance {
+    Provenance {
+        install_source: "github_release".to_string(),
+        wheel_platform: wheel.platform_key.clone(),
+    }
+}
+
 /// Download and install a compiled wheel from an already-fetched `CliRelease`.
 ///
 /// `python_version` is used for ABI-specific key lookup (e.g. `macos-arm64-cp313`).
@@ -773,9 +801,16 @@ fn print_detect_human(report: &prober::CapabilityReport) {
     println!();
     for tool in &report.tools {
         let mark = if tool.present { "[ok]" } else { "[--]" };
-        let version = tool.version.as_deref().unwrap_or("");
+        // A present tool with no version is a real state, not a formatting
+        // gap: right after the one-command bootstrap the launcher is installed
+        // but the managed venv has not been built yet, so there is no CLI
+        // version to report and the prober does not install one to find out.
+        let version = match &tool.version {
+            Some(v) => format!(" {v}"),
+            None => String::new(),
+        };
         let req = if tool.required { " (required)" } else { "" };
-        println!("  {mark} {}{req} {version}", tool.display_name);
+        println!("  {mark} {}{req}{version}", tool.display_name);
         if !tool.present {
             if let Some(hint) = &tool.install_hint {
                 println!("        install: {hint}");
@@ -810,5 +845,74 @@ impl Manifest {
             active_deployment: self.active_deployment.clone(),
             capability_cache: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wheel(platform_key: &str, filename: &str) -> download::WheelInfo {
+        download::WheelInfo {
+            platform_key: platform_key.to_string(),
+            filename: filename.to_string(),
+            sha256: "0".repeat(64),
+        }
+    }
+
+    #[test]
+    fn provenance_comes_from_the_installed_wheel() {
+        let installed = wheel(
+            "linux-x86_64-cp313",
+            "huitzo_cli-0.11.1-cp313-cp313-manylinux_2_28_x86_64.whl",
+        );
+        let provenance = install_provenance(&installed);
+
+        assert_eq!(provenance.install_source, "github_release");
+        assert_eq!(provenance.wheel_platform, "linux-x86_64-cp313");
+    }
+
+    #[test]
+    fn a_stale_wheel_in_the_cache_cannot_dictate_provenance() {
+        // M9 regression. `detect_install_source()` scanned
+        // `<huitzo_home>/cache/*.whl` and reported whatever it found, so a
+        // wheel left behind by an earlier release — or by an install that
+        // never completed — became the recorded provenance of an unrelated
+        // install. Stage exactly that situation: a cache full of wheels for a
+        // different release, platform and Python, and an install of something
+        // else entirely.
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("HUITZO_HOME", tmp.path()) };
+
+        let cache = tmp.path().join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        for stale in [
+            "huitzo_cli-0.9.0-cp312-cp312-macosx_11_0_arm64.whl",
+            "huitzo_cli-0.4.2-py3-none-any.whl",
+        ] {
+            std::fs::write(cache.join(stale), b"stale").unwrap();
+        }
+
+        let installed = wheel(
+            "linux-aarch64-cp313",
+            "huitzo_cli-0.11.1-cp313-cp313-manylinux_2_28_aarch64.whl",
+        );
+        let provenance = install_provenance(&installed);
+
+        assert_eq!(provenance.install_source, "github_release");
+        assert_eq!(
+            provenance.wheel_platform, "linux-aarch64-cp313",
+            "provenance must describe the install that happened, not the cache"
+        );
+        // And the cache is still exactly as it was: nothing read it, so
+        // nothing could have been inferred from it.
+        let mut left: Vec<String> = std::fs::read_dir(&cache)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        left.sort();
+        assert_eq!(left.len(), 2, "{left:?}");
+
+        unsafe { std::env::remove_var("HUITZO_HOME") };
     }
 }

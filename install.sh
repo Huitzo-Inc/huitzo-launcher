@@ -37,6 +37,12 @@ else
     HUITZO_HOME_IS_OVERRIDE=0
 fi
 HUITZO_HOME="${HUITZO_HOME:-$HOME/.huitzo}"
+# Exported, not just assigned: the capability check at the end of this script
+# runs the launcher we just installed, and that binary resolves its own home
+# from $HUITZO_HOME. Without the export a caller who set HUITZO_HOME as a plain
+# shell variable would have the installer write to one home and the launcher
+# report on another.
+export HUITZO_HOME
 INSTALL_DIR="$HUITZO_HOME/bin"
 VENV_DIR="$HUITZO_HOME/venv"
 CACHE_DIR="$HUITZO_HOME/cache"
