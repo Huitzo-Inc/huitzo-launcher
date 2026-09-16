@@ -19,6 +19,18 @@ const MAX_AUTO_ATTEMPTS: u32 = 3;
 /// invocation (M14).
 const RETRY_AFTER_SECS: u64 = 24 * 60 * 60;
 
+/// How many times the outgoing binary's restore is retried, and the step
+/// between tries, when installing the new one failed.
+///
+/// A restore that does not happen leaves the user with no launcher on PATH, so
+/// it is worth waiting out the transient blockers — an anti-virus scanner
+/// holding the file, a handle not yet released. The permanent ones (a full
+/// disk, an unwritable directory) are already ruled out before anything is
+/// moved, so this loop is bounded at roughly a second and never becomes the
+/// reason a launch hangs.
+const RESTORE_ATTEMPTS: u32 = 5;
+const RESTORE_BACKOFF_MS: u64 = 100;
+
 /// Check if update checking is disabled via environment variable.
 pub fn should_skip() -> bool {
     std::env::var("HUITZO_SKIP_UPDATE_CHECK")
@@ -291,28 +303,51 @@ pub fn self_update() -> Result<UpdateOutcome, Error> {
 /// (os error 5)`, and the founder's install sat on 0.3.2 because of it (B6).
 ///
 /// Windows *does* allow a running image to be **renamed**, so the sequence is:
-/// move the running binary aside to `<exe>.old`, move the new one into its
-/// place, then delete the old one — which succeeds immediately on Unix and on
-/// the next launch on Windows ([`cleanup_replaced_binary`]).
+/// stage the new binary beside the running one, move the running one aside to
+/// `<exe>.old`, rename the staged file into its place, then delete the old one
+/// — which succeeds immediately on Unix and on the next launch on Windows
+/// ([`cleanup_replaced_binary`]).
 ///
-/// If the second move fails the first is undone: an out-of-date launcher is
-/// recoverable, a missing one is not.
+/// Staging into the destination directory *first* is what keeps a half-done
+/// replacement off the user's disk. It is the only step that moves bytes, so
+/// it is where a full disk, an unwritable directory or a scanner refusing the
+/// write surfaces — and it surfaces with the working launcher still exactly
+/// where it was. What is left after it are two same-directory renames: they
+/// need no space, they cannot leave a truncated file behind, and a failed one
+/// is retried ([`restore_with_retry`]) rather than accepted. An out-of-date
+/// launcher is recoverable; a missing one is not.
 fn replace_running_binary(new_binary: &Path, current_exe: &Path) -> Result<(), Error> {
     let backup = backup_path(current_exe);
-    // Windows `rename` never overwrites, so a leftover `.old` from an earlier
-    // update would fail the move below before it started.
+    let staged = staged_path(current_exe);
+    // Windows `rename` never overwrites, so leftovers from an earlier update
+    // would fail the moves below before they started.
     let _ = std::fs::remove_file(&backup);
+    let _ = std::fs::remove_file(&staged);
 
-    std::fs::rename(current_exe, &backup).map_err(|e| {
-        Error::SelfUpdate(format!(
-            "Failed to move the running binary aside ({} -> {}): {e}",
+    if let Err(e) = move_file(new_binary, &staged) {
+        let _ = std::fs::remove_file(&staged);
+        return Err(Error::SelfUpdate(format!(
+            "Could not write the new binary into {}, so the update was not started \
+             and the launcher at {} is untouched: {e}",
+            current_exe.parent().unwrap_or(current_exe).display(),
+            current_exe.display()
+        )));
+    }
+
+    if let Err(e) = std::fs::rename(current_exe, &backup) {
+        let _ = std::fs::remove_file(&staged);
+        return Err(Error::SelfUpdate(format!(
+            "Failed to move the running binary aside ({} -> {}), so it is untouched: {e}",
             current_exe.display(),
             backup.display()
-        ))
-    })?;
+        )));
+    }
 
-    if let Err(e) = move_file(new_binary, current_exe) {
-        let restored = std::fs::rename(&backup, current_exe).is_ok();
+    // A rename either happens or does not: unlike a copy it cannot leave a
+    // truncated image at `current_exe`, so the restore below has a clear path.
+    if let Err(e) = std::fs::rename(&staged, current_exe) {
+        let restored = restore_with_retry(&backup, current_exe);
+        let _ = std::fs::remove_file(&staged);
         return Err(Error::SelfUpdate(format!(
             "Failed to install the new binary at {}: {e}{}",
             current_exe.display(),
@@ -332,11 +367,43 @@ fn replace_running_binary(new_binary: &Path, current_exe: &Path) -> Result<(), E
     Ok(())
 }
 
+/// Put the outgoing binary back after a failed install, retrying briefly.
+///
+/// The blockers that can still reach this point are transient by construction
+/// — the permanent ones failed the staging step before anything moved — and a
+/// launcher that exists is worth a second of backoff. Returns whether the
+/// binary is back in place; the caller reports the outcome either way, and
+/// only ever from this return value: a `current_exe` that merely *exists*
+/// could be the half-installed image, which is not a working launcher.
+fn restore_with_retry(backup: &Path, current_exe: &Path) -> bool {
+    for attempt in 0..RESTORE_ATTEMPTS {
+        if std::fs::rename(backup, current_exe).is_ok() {
+            return true;
+        }
+        if attempt + 1 < RESTORE_ATTEMPTS {
+            std::thread::sleep(std::time::Duration::from_millis(
+                RESTORE_BACKOFF_MS * u64::from(attempt + 1),
+            ));
+        }
+    }
+    false
+}
+
 /// Where the outgoing binary is parked during a replacement: `<exe>.old`
 /// (`huitzo.exe.old` on Windows, `huitzo.old` elsewhere).
 fn backup_path(current_exe: &Path) -> PathBuf {
     let mut name = current_exe.as_os_str().to_os_string();
     name.push(".old");
+    PathBuf::from(name)
+}
+
+/// Where the incoming binary is written before the swap: `<exe>.new`, in the
+/// install directory on purpose — see [`replace_running_binary`]. Neither
+/// suffix is executable by PATH lookup, so a leftover can never be run in
+/// place of the real launcher.
+fn staged_path(current_exe: &Path) -> PathBuf {
+    let mut name = current_exe.as_os_str().to_os_string();
+    name.push(".new");
     PathBuf::from(name)
 }
 
@@ -349,6 +416,10 @@ fn backup_path(current_exe: &Path) -> PathBuf {
 pub fn cleanup_replaced_binary() {
     if let Ok(exe) = std::env::current_exe() {
         let _ = std::fs::remove_file(backup_path(&exe));
+        // A staged binary from an update that died mid-swap is dead weight:
+        // the next update writes its own. Left alone it would accumulate one
+        // copy of the launcher per failed attempt.
+        let _ = std::fs::remove_file(staged_path(&exe));
     }
 }
 
@@ -1049,6 +1120,10 @@ mod tests {
             !backup_path(&exe).exists(),
             "the outgoing binary is unlinked here on Unix"
         );
+        assert!(
+            !staged_path(&exe).exists(),
+            "the staging file is consumed by the swap"
+        );
     }
 
     #[test]
@@ -1060,6 +1135,8 @@ mod tests {
         let new = dir.path().join("huitzo-new");
         write(&exe, "v2");
         write(&backup_path(&exe), "v1");
+        // And a staged file from an update that died mid-swap.
+        write(&staged_path(&exe), "half a binary");
         write(&new, "v3");
 
         replace_running_binary(&new, &exe).unwrap();
@@ -1067,9 +1144,10 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_replacement_puts_the_old_binary_back() {
+    fn a_failed_replacement_never_touches_the_installed_binary() {
         // The half-done state — running image moved aside, new one not
-        // installed — must never be what the user is left with.
+        // installed — must never be what the user is left with. A new binary
+        // that cannot be staged fails before anything is moved.
         let dir = tempfile::tempdir().unwrap();
         let exe = dir.path().join("huitzo");
         write(&exe, "old binary");
@@ -1077,13 +1155,118 @@ mod tests {
 
         let err = replace_running_binary(&missing, &exe).unwrap_err();
         assert!(
-            format!("{err}").contains("put back"),
+            format!("{err}").contains("untouched"),
             "unexpected message: {err}"
         );
         assert_eq!(
             std::fs::read_to_string(&exe).unwrap(),
             "old binary",
             "an out-of-date launcher is recoverable; a missing one is not"
+        );
+        assert!(
+            !backup_path(&exe).exists(),
+            "nothing should have been moved aside"
+        );
+        assert!(
+            !staged_path(&exe).exists(),
+            "the staging file must be cleaned up"
+        );
+    }
+
+    /// The brick the review reproduced: a destination directory that cannot be
+    /// written used to fail *after* the running binary had been moved aside,
+    /// and the restore failed for the same reason, leaving no launcher at all.
+    /// Staging first turns that into an update that simply did not happen.
+    #[test]
+    #[cfg(unix)]
+    fn an_unwritable_destination_leaves_the_launcher_in_place() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("huitzo");
+        write(&exe, "old binary");
+        let new = dir.path().join("huitzo-new");
+        write(&new, "new binary");
+
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        // Root ignores the permission bits this test's premise rests on, so
+        // probe the directory rather than the uid: if it is still writable
+        // there is nothing here to assert.
+        let probe = dir.path().join(".probe");
+        if std::fs::write(&probe, "x").is_ok() {
+            let _ = std::fs::remove_file(&probe);
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+
+        let err = replace_running_binary(&new, &exe).unwrap_err();
+
+        // Restore permissions before asserting so a failure still cleans up.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            format!("{err}").contains("untouched"),
+            "the user must be told the update did not start: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&exe).unwrap(),
+            "old binary",
+            "the working launcher must still be exactly where it was"
+        );
+        assert!(
+            !backup_path(&exe).exists(),
+            "the running binary must not have been moved aside"
+        );
+    }
+
+    /// Same guarantee without depending on permission bits at all: something
+    /// occupying the staged path that cannot be overwritten fails the
+    /// pre-flight, and the installed binary is never disturbed.
+    #[test]
+    fn a_blocked_staging_path_leaves_the_launcher_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("huitzo");
+        write(&exe, "old binary");
+        let new = dir.path().join("huitzo-new");
+        write(&new, "new binary");
+        // A directory cannot be replaced by `rename` or written by `copy`,
+        // whatever the uid.
+        std::fs::create_dir(staged_path(&exe)).unwrap();
+
+        let err = replace_running_binary(&new, &exe).unwrap_err();
+        assert!(format!("{err}").contains("untouched"), "{err}");
+        assert_eq!(std::fs::read_to_string(&exe).unwrap(), "old binary");
+        assert!(!backup_path(&exe).exists());
+    }
+
+    #[test]
+    fn the_restore_puts_the_outgoing_binary_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("huitzo");
+        let backup = backup_path(&exe);
+        write(&backup, "old binary");
+
+        assert!(restore_with_retry(&backup, &exe));
+        assert_eq!(std::fs::read_to_string(&exe).unwrap(), "old binary");
+        assert!(!backup.exists());
+    }
+
+    #[test]
+    fn the_restore_gives_up_instead_of_spinning() {
+        // A restore that genuinely cannot succeed must terminate — the caller
+        // reports the `.old` path so the user can recover by hand.
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("huitzo");
+        let absent = backup_path(&exe);
+
+        let started = std::time::Instant::now();
+        assert!(!restore_with_retry(&absent, &exe));
+        assert!(
+            !exe.exists(),
+            "nothing was restored, and nothing was invented"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the backoff must stay bounded"
         );
     }
 
