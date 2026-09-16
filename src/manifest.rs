@@ -17,6 +17,22 @@ pub struct PendingUpdate {
     pub kind: String,
     /// Target version.
     pub version: String,
+    /// How many times applying this update has already failed (M14).
+    ///
+    /// The record used to be cleared only on success, so a failing update was
+    /// re-announced and re-downloaded on *every* invocation. These three
+    /// fields are what lets a failure settle: `update::should_attempt` reads
+    /// them, `update::record_failed_attempt` writes them, and a check that
+    /// re-stages the same version carries them forward instead of resetting
+    /// the count.
+    #[serde(default)]
+    pub attempts: u32,
+    /// Unix timestamp of the last failed attempt (0 if none).
+    #[serde(default)]
+    pub last_attempt: u64,
+    /// First line of the last failure, quoted back when an attempt is deferred.
+    #[serde(default)]
+    pub last_error: Option<String>,
 }
 
 /// Cached capability-document state for the active deployment.
@@ -217,6 +233,18 @@ mod tests {
         assert_eq!(parsed.schema_version, 2);
         assert!(parsed.active_deployment.is_none());
         assert!(parsed.capability_cache.is_none());
+    }
+
+    #[test]
+    fn a_pending_update_written_before_the_retry_fields_existed_still_loads() {
+        // Manifests in the wild carry `{kind, version}` only. They must
+        // deserialize with a zeroed attempt record rather than being treated
+        // as corrupt (which would wipe the whole manifest and re-bootstrap).
+        let json = r#"{"kind": "launcher", "version": "0.3.3"}"#;
+        let parsed: PendingUpdate = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.attempts, 0);
+        assert_eq!(parsed.last_attempt, 0);
+        assert!(parsed.last_error.is_none());
     }
 
     #[test]

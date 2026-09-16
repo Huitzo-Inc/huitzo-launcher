@@ -84,9 +84,23 @@ fn main() {
     }
 
     if args.iter().any(|a| a == "--launcher-update") {
-        if let Err(e) = update::self_update() {
-            eprintln!("Error: {e}");
-            std::process::exit(errors::exit_code(&e));
+        match update::self_update() {
+            // The explicit path settles the same bookkeeping the automatic one
+            // does, so a manual update does not leave a staged record behind
+            // for the next launch to act on again. Only a real install moves
+            // `launcher_version` (M13).
+            Ok(update::UpdateOutcome::Updated(version)) => {
+                update::settle_pending(Some(&version));
+            }
+            Ok(
+                update::UpdateOutcome::AlreadyCurrent | update::UpdateOutcome::DeferredToHomebrew,
+            ) => {
+                update::settle_pending(None);
+            }
+            Err(e) => {
+                eprintln!("Error: {e}");
+                std::process::exit(errors::exit_code(&e));
+            }
         }
         return;
     }
@@ -256,50 +270,93 @@ fn run_with(args: Vec<String>, force_trust_rotate: bool, use_installed: bool) {
     // 5. Reload manifest — sync_check may have written a pending update.
     let manifest = manifest::load().or(manifest);
 
+    // 5.5 Clear the binary an update on this machine left behind. Windows
+    // cannot delete the image it is running from, so the launch *after* the
+    // update is the one that gets to do it (B6).
+    update::cleanup_replaced_binary();
+
     // 6. Apply pending update if flagged
     if let Some(ref m) = manifest {
         if let Some(ref pending) = m.pending_update {
-            match pending.kind.as_str() {
-                "launcher" => {
-                    // Self-update the launcher binary from GitHub Releases.
-                    eprintln!("Updating huitzo-launcher to {}...", pending.version);
-                    let update_ok = update::self_update().is_ok();
-                    if update_ok {
-                        let mut updated = manifest::load().unwrap_or_else(|| m.clone_for_update());
-                        updated.pending_update = None;
-                        updated.launcher_version = pending.version.clone();
-                        let _ = manifest::save(&updated);
-                    }
-                }
-                kind => {
-                    eprintln!("Updating huitzo to {}...", pending.version);
-                    // Every CLI update is a wheel from the release feed. The
-                    // old `"pip"` kind installed from PyPI, which is where the
-                    // 0.2.0 placeholder lived (#B4); a manifest still carrying
-                    // that kind gets the wheel path, not a resurrected fallback
-                    // (D5). `apply_wheel_update` verifies the result before it
-                    // can be reported as applied.
-                    // Pass the Python version so ABI-keyed manifests resolve correctly.
-                    let pv = parse_python_version(&m.python_version);
-                    let installed = match kind {
-                        "wheel" | "pip" => apply_wheel_update(pv)
-                            .inspect_err(|e| {
-                                eprintln!("Warning: update to {} failed: {e}", pending.version)
-                            })
-                            .ok(),
-                        other => {
-                            eprintln!("Warning: ignoring unknown pending update kind '{other}'");
-                            None
+            if !update::should_attempt(pending, manifest::now_secs()) {
+                // A failed update must settle instead of re-announcing and
+                // re-downloading itself on every single invocation (M14). The
+                // notice names the failure and the command that retries it.
+                eprintln!("{}", update::deferral_notice(pending));
+            } else {
+                match pending.kind.as_str() {
+                    "launcher" => {
+                        // Self-update the launcher binary from GitHub Releases.
+                        eprintln!("Updating huitzo-launcher to {}...", pending.version);
+                        match update::self_update() {
+                            // Only a binary that was actually written moves
+                            // `launcher_version` (M13) — "Homebrew owns this"
+                            // and "already current" both install nothing.
+                            Ok(update::UpdateOutcome::Updated(version)) => {
+                                update::settle_pending(Some(&version));
+                            }
+                            Ok(
+                                update::UpdateOutcome::AlreadyCurrent
+                                | update::UpdateOutcome::DeferredToHomebrew,
+                            ) => {
+                                update::settle_pending(None);
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "Warning: launcher update to {} failed: {e}",
+                                    pending.version
+                                );
+                                update::record_failed_attempt(
+                                    &pending.kind,
+                                    &pending.version,
+                                    &e.to_string(),
+                                );
+                            }
                         }
-                    };
-                    // The version comes from the post-install probe that just
-                    // vouched for this environment, so the manifest records
-                    // what actually runs rather than what pip was asked for.
-                    if let Some(version) = installed {
-                        let mut updated = manifest::load().unwrap_or_else(|| m.clone_for_update());
-                        updated.pending_update = None;
-                        updated.huitzo_version = version;
-                        let _ = manifest::save(&updated);
+                    }
+                    kind => {
+                        eprintln!("Updating huitzo to {}...", pending.version);
+                        // Every CLI update is a wheel from the release feed. The
+                        // old `"pip"` kind installed from PyPI, which is where the
+                        // 0.2.0 placeholder lived (#B4); a manifest still carrying
+                        // that kind gets the wheel path, not a resurrected fallback
+                        // (D5). `apply_wheel_update` verifies the result before it
+                        // can be reported as applied.
+                        // Pass the Python version so ABI-keyed manifests resolve correctly.
+                        let pv = parse_python_version(&m.python_version);
+                        let installed = match kind {
+                            "wheel" | "pip" => match apply_wheel_update(pv) {
+                                Ok(version) => Some(version),
+                                Err(e) => {
+                                    eprintln!("Warning: update to {} failed: {e}", pending.version);
+                                    update::record_failed_attempt(
+                                        &pending.kind,
+                                        &pending.version,
+                                        &e.to_string(),
+                                    );
+                                    None
+                                }
+                            },
+                            other => {
+                                eprintln!(
+                                    "Warning: ignoring unknown pending update kind '{other}'"
+                                );
+                                // Nothing will ever apply this record, so drop
+                                // it rather than warn about it forever.
+                                update::settle_pending(None);
+                                None
+                            }
+                        };
+                        // The version comes from the post-install probe that just
+                        // vouched for this environment, so the manifest records
+                        // what actually runs rather than what pip was asked for.
+                        if let Some(version) = installed {
+                            let mut updated =
+                                manifest::load().unwrap_or_else(|| m.clone_for_update());
+                            updated.pending_update = None;
+                            updated.huitzo_version = version;
+                            let _ = manifest::save(&updated);
+                        }
                     }
                 }
             }
