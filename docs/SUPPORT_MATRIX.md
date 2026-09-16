@@ -72,6 +72,14 @@ Two environment variables make such a host work:
 | `HTTPS_PROXY` (or `HTTP_PROXY` / `ALL_PROXY`) | `http://proxy.corp:8080`. The scheme-less spelling `proxy.corp:8080` is accepted too, as are `https://`, `socks5://` and `user:password@` (credentials are redacted before any error message is printed). `NO_PROXY=localhost,.internal.corp` carves out direct routes. A value the launcher cannot parse is a hard error, not a silent direct connection. |
 | `HUITZO_CA_BUNDLE` | Path to a PEM file holding the intercepting CA. It **replaces** the bundled roots rather than adding to them — same semantics as `CURL_CA_BUNDLE` — so on a machine that must also reach the public internet, point it at the system bundle, which already holds both: `/etc/ssl/certs/ca-certificates.crt` (Debian/Ubuntu), `/etc/pki/tls/certs/ca-bundle.crt` (RHEL/Fedora). |
 
+**The proxy variables were previously ignored.** Earlier launcher releases
+never read `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` and always connected
+direct, so a stale value — a leftover VPN profile, a decommissioned corporate
+proxy — was harmless. It is not harmless now: the launcher routes through
+whatever those variables name, so an install that previously worked will fail
+if the proxy they point at is dead. Unset them, or list the hosts they must
+not apply to in `NO_PROXY`, before installing.
+
 ```sh
 export HTTPS_PROXY=http://proxy.corp:8080
 export HTTP_PROXY=http://proxy.corp:8080
