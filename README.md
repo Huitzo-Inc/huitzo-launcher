@@ -40,10 +40,10 @@ iwr -useb https://raw.githubusercontent.com/Huitzo-Inc/huitzo-launcher/main/inst
 ```
 
 The Huitzo **CLI** installs and runs natively on Windows — no WSL required.
-The Studio **runner** requires **WSL2** (its outbound daemon and the
-launcher's POSIX `execvp` hand-off assume a POSIX process model): to pair a
-local runner on a Windows machine, install into WSL2 (Ubuntu) and run the
-Linux command above inside your distro. See
+The Studio **runner** requires **WSL2** (its own outbound daemon and process
+model assume a POSIX shell, and its bootstrap is the `curl | sh` script): to
+pair a local runner on a Windows machine, install into WSL2 (Ubuntu) and run
+the Linux command above inside your distro. See
 [`docs/SUPPORT_MATRIX.md`](docs/SUPPORT_MATRIX.md) for the full support
 matrix and rationale (admin-locked corporate machines are marked
 unsupported).
