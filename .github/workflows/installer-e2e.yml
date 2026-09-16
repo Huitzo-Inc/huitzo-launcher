@@ -305,9 +305,24 @@ jobs:
           Set-Content -Path (Join-Path $dir "$env:ASSET.sha256") -Value $hash -NoNewline
           Write-Host "staged $env:ASSET  sha256=$hash"
 
+      # `shell: powershell` — Windows PowerShell 5.1, not pwsh 7 — on purpose.
+      # It is what install.ps1 documents ("PowerShell 5.1+"), what the default
+      # Windows terminal runs, and therefore what the documented
+      # `iwr -useb ... | iex` one-liner is actually executed by. It is also the
+      # stricter host: 5.1 is where `Invoke-WebRequest`'s `.Content` is a
+      # `Byte[]`, the bug that once downgraded checksum verification to a
+      # warning. (pwsh 7's HttpClient additionally has no `file` scheme, so the
+      # local-asset override cannot run there; the shipped https path behaves
+      # identically on both.)
       - name: install.ps1 reaches a working CLI
+        shell: powershell
         run: |
-          $ErrorActionPreference = 'Stop'
+          # The runner injects `$ErrorActionPreference = 'stop'`, under which a
+          # native command writing to stderr — which the launcher's whole
+          # bootstrap progress is — raises a terminating error. Exit codes are
+          # the contract here, and they are checked explicitly below.
+          $ErrorActionPreference = 'Continue'
+
           # Sandbox FIRST, in this process, and echoed back as proof.
           $env:HUITZO_HOME = Join-Path $env:RUNNER_TEMP 'home-stock'
           Write-Host "sandboxed HUITZO_HOME=$env:HUITZO_HOME"
@@ -315,12 +330,16 @@ jobs:
           $env:HUITZO_LAUNCHER_ASSET_URL = 'file:///' + ($asset -replace '\\','/')
 
           .\install.ps1
-          if ($LASTEXITCODE -ne 0) { throw "install.ps1 exited $LASTEXITCODE" }
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::install.ps1 exited $LASTEXITCODE"; exit 1 }
 
           $version = & (Join-Path $env:HUITZO_HOME 'bin\huitzo.exe') --version 2>&1 | Out-String
+          $rc = $LASTEXITCODE
           Write-Host $version
-          if ($LASTEXITCODE -ne 0) { throw "huitzo --version exited $LASTEXITCODE" }
-          if ($version -notmatch 'huitzo-cli \d+\.\d+') { throw "no huitzo-cli version line in: $version" }
+          if ($rc -ne 0) { Write-Host "::error::huitzo --version exited $rc"; exit 1 }
+          if ($version -notmatch 'huitzo-cli \d+\.\d+') {
+            Write-Host "::error::no huitzo-cli version line in the output above"; exit 1
+          }
+          exit 0
 
       # B7: the launcher used to look for `python.exe` and give up when a host
       # only had the `py` launcher. Hide every `python.exe` on PATH and require
@@ -328,8 +347,9 @@ jobs:
       # registry, or a uv-provisioned CPython is the launcher's business; a
       # working CLI is not negotiable.
       - name: 'B7 — install.ps1 reaches a working CLI with python.exe off PATH'
+        shell: powershell
         run: |
-          $ErrorActionPreference = 'Stop'
+          $ErrorActionPreference = 'Continue'
           $kept = @()
           foreach ($dir in ($env:PATH -split ';')) {
             if (-not $dir) { continue }
@@ -342,7 +362,9 @@ jobs:
           $env:PATH = $kept -join ';'
 
           $python = Get-Command python.exe -CommandType Application -ErrorAction SilentlyContinue
-          if ($python) { throw "python.exe is still resolvable at $($python.Source)" }
+          if ($python) {
+            Write-Host "::error::python.exe is still resolvable at $($python.Source)"; exit 1
+          }
           # The py launcher is what B7 was originally about. If a future runner
           # image drops it, say so loudly and keep the rest of the case (no
           # python.exe on PATH) rather than quietly reporting a green B7.
@@ -360,12 +382,16 @@ jobs:
           $env:HUITZO_LAUNCHER_ASSET_URL = 'file:///' + ($asset -replace '\\','/')
 
           .\install.ps1
-          if ($LASTEXITCODE -ne 0) { throw "install.ps1 exited $LASTEXITCODE" }
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::install.ps1 exited $LASTEXITCODE"; exit 1 }
 
           $version = & (Join-Path $env:HUITZO_HOME 'bin\huitzo.exe') --version 2>&1 | Out-String
+          $rc = $LASTEXITCODE
           Write-Host $version
-          if ($LASTEXITCODE -ne 0) { throw "huitzo --version exited $LASTEXITCODE" }
-          if ($version -notmatch 'huitzo-cli \d+\.\d+') { throw "no huitzo-cli version line in: $version" }
+          if ($rc -ne 0) { Write-Host "::error::huitzo --version exited $rc"; exit 1 }
+          if ($version -notmatch 'huitzo-cli \d+\.\d+') {
+            Write-Host "::error::no huitzo-cli version line in the output above"; exit 1
+          }
+          exit 0
 
       - name: Remove the scratch homes
         if: always()
