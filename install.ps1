@@ -23,6 +23,19 @@
 #   HUITZO_HOME            - override install root (default: $env:USERPROFILE\.huitzo)
 #   HUITZO_NO_MODIFY_PATH  - set to 1 to skip PATH modification
 #   HUITZO_ASSUME_YES      - set to 1 to grant install consent non-interactively
+#   HUITZO_LAUNCHER_ASSET_URL
+#                          - fetch the launcher binary from this URI instead of
+#                            discovering the newest v* GitHub release. Any URI
+#                            Invoke-WebRequest understands, including file:///.
+#                            Everything downstream - checksum verification,
+#                            install, PATH, capability check - is unchanged, so
+#                            this exercises the real installer against a binary
+#                            you choose. CI uses it so a pull request is tested
+#                            against the launcher built from its own commit
+#                            rather than whatever happens to be published (M6).
+#   HUITZO_LAUNCHER_SHA256_URL
+#                          - where that binary's SHA-256 lives.
+#                            Default: "$HUITZO_LAUNCHER_ASSET_URL.sha256".
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $ErrorActionPreference = "Stop"
@@ -165,26 +178,45 @@ if ($env:HUITZO_ASSUME_YES -eq "1") {
 # its own without needing the non-interactive override.
 $env:HUITZO_BOOTSTRAP_CONSENTED = "1"
 
-# 1. Fetch latest launcher release
-Write-Step "Fetching latest release..."
-try {
-    $releases = Invoke-RestMethod "https://api.github.com/repos/$REPO/releases?per_page=20" -UseBasicParsing
-} catch {
-    Write-Fail "Could not reach GitHub API: $_"
-}
+# 1. Decide where the launcher binary comes from.
+#
+# An explicitly supplied binary short-circuits release discovery - and ONLY
+# release discovery. The download and the checksum gate below still run exactly
+# as they do for a published release, so this is a different source, never a
+# weaker install.
+if ($env:HUITZO_LAUNCHER_ASSET_URL) {
+    $AssetUrl  = $env:HUITZO_LAUNCHER_ASSET_URL
+    $Sha256Url = if ($env:HUITZO_LAUNCHER_SHA256_URL) { $env:HUITZO_LAUNCHER_SHA256_URL } else { "$AssetUrl.sha256" }
+    # Keep the progress line honest: it names what is actually being fetched,
+    # not the asset name this script computed for a published release.
+    $ASSET = Split-Path -Leaf ([Uri]$AssetUrl).LocalPath
+    Write-Step "Launcher source: $AssetUrl (HUITZO_LAUNCHER_ASSET_URL)"
+} else {
+    Write-Step "Fetching latest release..."
+    try {
+        $releases = Invoke-RestMethod "https://api.github.com/repos/$REPO/releases?per_page=20" -UseBasicParsing
+    } catch {
+        Write-Fail "Could not reach GitHub API: $_"
+    }
 
-$release = Select-LauncherRelease $releases
-if (-not $release) {
-    Write-Fail "No launcher release found. Check: https://github.com/$REPO/releases"
-}
+    $release = Select-LauncherRelease $releases
+    if (-not $release) {
+        Write-Fail "No launcher release found. Check: https://github.com/$REPO/releases"
+    }
 
-$assetInfo   = $release.assets | Where-Object { $_.name -eq $ASSET } | Select-Object -First 1
-$sha256Info  = $release.assets | Where-Object { $_.name -eq "$ASSET.sha256" } | Select-Object -First 1
+    $assetInfo   = $release.assets | Where-Object { $_.name -eq $ASSET } | Select-Object -First 1
+    $sha256Info  = $release.assets | Where-Object { $_.name -eq "$ASSET.sha256" } | Select-Object -First 1
 
-if (-not $assetInfo) {
-    Write-Fail "Asset '$ASSET' not found in release $($release.tag_name). Check: https://github.com/$REPO/releases"
+    if (-not $assetInfo) {
+        Write-Fail "Asset '$ASSET' not found in release $($release.tag_name). Check: https://github.com/$REPO/releases"
+    }
+    if (-not $sha256Info) {
+        Write-Fail "Release $($release.tag_name) publishes no '$ASSET.sha256' - refusing to install an unverified binary."
+    }
+    $AssetUrl  = $assetInfo.browser_download_url
+    $Sha256Url = $sha256Info.browser_download_url
+    Write-Step "Version: $($release.tag_name)"
 }
-Write-Step "Version: $($release.tag_name)"
 
 # 2. Clean old venv and cache (force fresh CLI install)
 if (Test-Path $VenvDir) {
@@ -255,18 +287,15 @@ if (-not $HuitzoHomeIsOverride) {
 $TmpFile = Join-Path $env:TEMP "huitzo-install-$([System.Guid]::NewGuid().ToString('N')).exe"
 Write-Step "Downloading $ASSET..."
 try {
-    Invoke-WebRequest -Uri $assetInfo.browser_download_url -OutFile $TmpFile -UseBasicParsing
+    Invoke-WebRequest -Uri $AssetUrl -OutFile $TmpFile -UseBasicParsing
 } catch {
     Write-Fail "Download failed: $_"
 }
 
 # 5. Verify SHA256 checksum. There is no path past this block that installs an
-#    unverified binary: no checksum asset, an unreadable checksum, or a mismatch
-#    all abort. "Skipping verification" is not a thing an installer gets to do.
-if (-not $sha256Info) {
-    Remove-Item $TmpFile -Force -ErrorAction SilentlyContinue
-    Write-Fail "Release $($release.tag_name) publishes no '$ASSET.sha256' - refusing to install an unverified binary."
-}
+#    unverified binary: a missing checksum source (checked before the download,
+#    above), an unreadable checksum, or a mismatch all abort. "Skipping
+#    verification" is not a thing an installer gets to do.
 Write-Step "Verifying checksum..."
 try {
     # Invoke-RestMethod returns a decoded String on both Windows PowerShell 5.1
@@ -275,7 +304,7 @@ try {
     # verification, installing an UNVERIFIED binary.) The [string] cast keeps the
     # normal string case a no-op while forcing any unexpected non-string into a
     # (fatal) mismatch/verification failure below rather than a silent skip.
-    $checksumContent = ([string](Invoke-RestMethod -Uri $sha256Info.browser_download_url -UseBasicParsing)).Trim()
+    $checksumContent = ([string](Invoke-RestMethod -Uri $Sha256Url -UseBasicParsing)).Trim()
     $expected = ($checksumContent -split '\s+')[0].ToLower()
     if ($expected -notmatch '^[0-9a-f]{64}$') {
         throw "published checksum is not a SHA-256 digest: '$checksumContent'"

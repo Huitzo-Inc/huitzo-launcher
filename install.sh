@@ -24,6 +24,19 @@
 #   HUITZO_NO_MODIFY_PATH  — set to 1 to skip shell profile modification
 #   HUITZO_ASSUME_YES      — set to 1 to grant install consent non-interactively
 #                            (recorded in the consent ledger for auditability)
+#   HUITZO_LAUNCHER_ASSET_URL
+#                          — fetch the launcher binary from this URL instead of
+#                            discovering the newest v* GitHub release. Any scheme
+#                            curl understands, including file://. Everything
+#                            downstream — checksum verification, install, PATH,
+#                            capability check — is unchanged, so this exercises
+#                            the real installer against a binary you choose.
+#                            CI uses it so a pull request is tested against the
+#                            launcher built from its own commit rather than
+#                            whatever happens to be published (M6).
+#   HUITZO_LAUNCHER_SHA256_URL
+#                          — where that binary's SHA-256 lives.
+#                            Default: "$HUITZO_LAUNCHER_ASSET_URL.sha256".
 set -eu
 
 REPO="Huitzo-Inc/huitzo-launcher"
@@ -230,6 +243,21 @@ detect_platform() {
 }
 
 fetch_latest_version() {
+    # An explicitly supplied binary short-circuits release discovery — and
+    # ONLY release discovery. The download and the checksum gate below still
+    # run exactly as they do for a published release, so this is a different
+    # source, never a weaker install.
+    if [ -n "${HUITZO_LAUNCHER_ASSET_URL:-}" ]; then
+        DOWNLOAD_URL="$HUITZO_LAUNCHER_ASSET_URL"
+        SHA256_URL="${HUITZO_LAUNCHER_SHA256_URL:-${DOWNLOAD_URL}.sha256}"
+        VERSION="(supplied)"
+        # Keep the progress line honest: it names what is actually being
+        # fetched, not the asset name the platform check computed.
+        ASSET="${DOWNLOAD_URL##*/}"
+        echo "  Launcher source: $DOWNLOAD_URL (HUITZO_LAUNCHER_ASSET_URL)"
+        return 0
+    fi
+
     echo "  Fetching latest launcher release..."
 
     # Fetch up to 20 releases (newest first).  /releases/latest returns the most
