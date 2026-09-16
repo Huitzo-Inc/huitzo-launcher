@@ -474,7 +474,9 @@ jobs:
           }
           $pip = & (Join-Path $env:HUITZO_HOME 'venv\Scripts\python.exe') -m pip show huitzo 2>&1 | Out-String
           if ($LASTEXITCODE -ne 0) { Write-Host "::error::pip show huitzo found nothing in the managed venv"; Write-Host $pip; exit 1 }
-          if ($pip -notmatch "(?m)^Version: $([regex]::Escape($cliVersion))$") {
+          # `\s*$`, not `$`: pip's lines end CRLF and .NET's multiline `$`
+          # anchors before the LF, leaving the CR unmatched.
+          if ($pip -notmatch "(?m)^Version: $([regex]::Escape($cliVersion))\s*$") {
             Write-Host "::error::pip reports a different version than the CLI ($cliVersion)"; Write-Host $pip; exit 1
           }
           if ($pip -match 'MOVED') { Write-Host "::error::the installed distribution is the MOVED PyPI placeholder"; Write-Host $pip; exit 1 }
@@ -551,7 +553,9 @@ jobs:
           }
           $pip = & (Join-Path $env:HUITZO_HOME 'venv\Scripts\python.exe') -m pip show huitzo 2>&1 | Out-String
           if ($LASTEXITCODE -ne 0) { Write-Host "::error::pip show huitzo found nothing in the managed venv"; Write-Host $pip; exit 1 }
-          if ($pip -notmatch "(?m)^Version: $([regex]::Escape($cliVersion))$") {
+          # `\s*$`, not `$`: pip's lines end CRLF and .NET's multiline `$`
+          # anchors before the LF, leaving the CR unmatched.
+          if ($pip -notmatch "(?m)^Version: $([regex]::Escape($cliVersion))\s*$") {
             Write-Host "::error::pip reports a different version than the CLI ($cliVersion)"; Write-Host $pip; exit 1
           }
           if ($pip -match 'MOVED') { Write-Host "::error::the installed distribution is the MOVED PyPI placeholder"; Write-Host $pip; exit 1 }
