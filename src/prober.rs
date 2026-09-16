@@ -187,18 +187,22 @@ fn managed_launcher() -> Option<PathBuf> {
 /// Probe the Huitzo CLI itself.
 ///
 /// Two deliberate departures from [`probe_tool`], both needed for the report to
-/// be true at the moment `install.sh` asks for it (M2):
+/// be true — at the moment `install.sh` asks for it (M2), and afterwards:
 ///
-/// * **`PATH` is not the first place we look.** The installer writes the
-///   launcher to `<huitzo_home>/bin` and appends that directory to a shell
-///   *profile*; the `PATH` of the shell running the installer is still the
-///   stale pre-install one. Trusting it is why the one-command bootstrap ended
-///   on `[--] Huitzo CLI` / `Missing required tools: huitzo` — declaring the
-///   tool it had just installed missing. So the managed binary is resolved by
-///   absolute path first, and `PATH` is the fallback for an installation this
-///   launcher does not manage (pip/pipx, Homebrew, a dev shim). `which` is
-///   still what answers "is this an executable file", so a `$HUITZO_HOME/bin`
-///   that holds nothing runnable is still reported missing.
+/// * **`PATH` decides; the managed binary is the fallback.** Typing `huitzo`
+///   runs whatever `PATH` resolves first, so that is what the report names. A
+///   stale pip/pipx `huitzo` ahead of `<huitzo_home>/bin` shadows the managed
+///   install, and naming the managed one there would report a launcher that is
+///   not the one that runs — the report would be wrong about the only thing it
+///   exists to answer. `PATH` having no `huitzo` at all is the M2 case: the
+///   installer writes the launcher to `<huitzo_home>/bin` and appends that
+///   directory to a shell *profile*, so the `PATH` of the shell running the
+///   installer is still the stale pre-install one. That is why the one-command
+///   bootstrap used to end on `[--] Huitzo CLI` / `Missing required tools:
+///   huitzo`, declaring the tool it had just installed missing; the managed
+///   binary answers there. `which` is still what answers "is this an executable
+///   file", so a `$HUITZO_HOME/bin` that holds nothing runnable is still
+///   reported missing.
 /// * **A launcher is never asked for `--version`.** That flag is answered by
 ///   the *Python* CLI, so reaching it means the launcher bootstraps the managed
 ///   venv first — downloading `uv`, a CPython and a wheel. A prober documented
@@ -207,9 +211,9 @@ fn managed_launcher() -> Option<PathBuf> {
 ///   to be a launcher has its CLI version read out of the manifest the
 ///   bootstrap writes, and simply has none until a bootstrap has happened.
 fn probe_huitzo() -> ToolProbe {
-    let resolved = managed_launcher()
-        .and_then(|m| which::which(m).ok())
-        .or_else(|| which::which("huitzo").ok());
+    let resolved = which::which("huitzo")
+        .ok()
+        .or_else(|| managed_launcher().and_then(|m| which::which(m).ok()));
 
     let version = resolved.as_deref().and_then(huitzo_version);
 
@@ -928,6 +932,27 @@ mod tests {
         assert_eq!(json.matches("\\u001b").count(), 0);
     }
 
+    /// Replace `PATH` with an empty directory and hand back the old value.
+    ///
+    /// The fallback tests below are about what happens when `PATH` has no
+    /// `huitzo` on it. A dev box usually does have one (a cargo-installed
+    /// launcher), so leaving the real `PATH` in place would have them assert
+    /// the wrong branch — or pass for the wrong reason.
+    fn path_without_huitzo(dir: &Path) -> Option<std::ffi::OsString> {
+        let empty = dir.join("empty-path");
+        std::fs::create_dir_all(&empty).unwrap();
+        let previous = std::env::var_os("PATH");
+        unsafe { std::env::set_var("PATH", &empty) };
+        previous
+    }
+
+    fn restore_path(previous: Option<std::ffi::OsString>) {
+        match previous {
+            Some(p) => unsafe { std::env::set_var("PATH", p) },
+            None => unsafe { std::env::remove_var("PATH") },
+        }
+    }
+
     #[cfg(unix)]
     fn write_shim(path: &Path, body: &str) {
         use std::os::unix::fs::PermissionsExt;
@@ -941,6 +966,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("HUITZO_HOME", tmp.path()) };
         std::fs::create_dir_all(tmp.path().join("bin")).unwrap();
+        // Nothing on PATH, so the managed binary is what gets probed.
+        let previous_path = path_without_huitzo(tmp.path());
 
         // A stand-in launcher: answers --launcher-version instantly (as the
         // real one does, before consent/bootstrap/network), and treats
@@ -981,6 +1008,7 @@ mod tests {
             "the prober bootstrapped the managed venv"
         );
 
+        restore_path(previous_path);
         unsafe { std::env::remove_var("HUITZO_HOME") };
     }
 
@@ -1005,9 +1033,13 @@ mod tests {
     }
 
     #[test]
-    fn managed_launcher_is_resolved_under_huitzo_home_not_path() {
+    fn a_stale_path_falls_back_to_the_managed_launcher() {
+        // M2: the shell running `install.sh` has the pre-install PATH, so
+        // `huitzo` is not on it. The managed binary answers instead, which is
+        // what stops the bootstrap ending on "Missing required tools: huitzo".
         let tmp = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("HUITZO_HOME", tmp.path()) };
+        let previous_path = path_without_huitzo(tmp.path());
 
         // An empty $HUITZO_HOME/bin must NOT be reported as an install: the
         // fix for M2 is "look in the right place", not "assume success".
@@ -1022,6 +1054,10 @@ mod tests {
             })
         );
         assert!(which::which(&managed).is_err());
+        assert!(
+            !probe_huitzo().present,
+            "an empty bin dir is not an install"
+        );
 
         // A real executable there resolves, with no PATH entry for it.
         std::fs::write(&managed, "#!/bin/sh\nexit 0\n").unwrap();
@@ -1036,7 +1072,63 @@ mod tests {
             assert_eq!(probe.install_hint, None);
         }
 
+        restore_path(previous_path);
         unsafe { std::env::remove_var("HUITZO_HOME") };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_shadowing_path_install_is_reported_over_the_managed_one() {
+        // R64: `huitzo` on PATH ahead of $HUITZO_HOME/bin is what the user's
+        // shell executes, so it is what the report must name. Reporting the
+        // managed launcher here would name a binary that is not the one that
+        // runs — and would hand the Hub rail the managed CLI's version for an
+        // install the user never invokes.
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("HUITZO_HOME", tmp.path()) };
+        std::fs::create_dir_all(tmp.path().join("bin")).unwrap();
+
+        // A complete managed install: the launcher, plus the manifest its
+        // bootstrap wrote recording a much newer CLI.
+        let managed = managed_launcher().expect("HUITZO_HOME is set");
+        write_shim(
+            &managed,
+            "case \"$1\" in\n  --launcher-version) echo 'huitzo-launcher 0.3.3'; exit 0 ;;\nesac\n",
+        );
+        std::fs::write(
+            crate::dirs::manifest_path(),
+            r#"{"schema_version":3,"python_path":"/usr/bin/python3","python_version":"3.13","huitzo_version":"0.11.1","launcher_version":"0.3.3","last_update_check":0,"pending_update":null,"created_at":0}"#,
+        )
+        .unwrap();
+
+        // And a stale pip/pipx install shadowing it on PATH.
+        let pip_dir = tmp.path().join("pip-bin");
+        std::fs::create_dir_all(&pip_dir).unwrap();
+        let pip_shim = pip_dir.join("huitzo");
+        write_shim(
+            &pip_shim,
+            "case \"$1\" in\n  --launcher-version) exit 1 ;;\n  --version) echo '0.9.0'; exit 0 ;;\nesac\n",
+        );
+
+        let previous_path = std::env::var_os("PATH");
+        unsafe { std::env::set_var("PATH", &pip_dir) };
+
+        let probe = probe_huitzo();
+
+        restore_path(previous_path);
+        unsafe { std::env::remove_var("HUITZO_HOME") };
+
+        assert!(probe.present);
+        assert_eq!(
+            probe.path.as_deref(),
+            pip_shim.to_str(),
+            "the report must name the binary the shell actually runs"
+        );
+        assert_eq!(
+            probe.version.as_deref(),
+            Some("0.9.0"),
+            "the shadowed managed manifest must not supply the version"
+        );
     }
 
     #[test]
