@@ -139,7 +139,7 @@ pub fn probe() -> CapabilityReport {
             &["claude"],
             &["--version"],
             true,
-            Some("npm install -g @anthropic-ai/claude-code"),
+            claude_install_hint(&host.os),
         ),
         probe_tool(
             "git",
@@ -578,6 +578,16 @@ fn is_wsl() -> bool {
         .unwrap_or(false)
 }
 
+/// Per-OS Claude Code install hint: Anthropic's native installer, which needs
+/// no Node.js. Native Windows gets the PowerShell form; the shell form only
+/// works there inside WSL2.
+fn claude_install_hint(os: &str) -> Option<&'static str> {
+    match os {
+        "windows" => Some("irm https://claude.ai/install.ps1 | iex"),
+        _ => Some("curl -fsSL https://claude.ai/install.sh | bash"),
+    }
+}
+
 /// Per-OS (and, on Linux, per-distro) git install hint for the probe's
 /// `install_hint`.
 fn git_install_hint(os: &str) -> Option<&'static str> {
@@ -691,6 +701,21 @@ mod tests {
         let (level, reason) = classify_support("freebsd", false, None);
         assert_eq!(level, SupportLevel::Unsupported);
         assert!(reason.unwrap().contains("freebsd"));
+    }
+
+    #[test]
+    fn claude_install_hint_is_the_native_installer_for_each_os() {
+        // No Node.js prerequisite on any OS, and no shell pipe on native Windows.
+        for os in ["linux", "macos"] {
+            assert_eq!(
+                claude_install_hint(os),
+                Some("curl -fsSL https://claude.ai/install.sh | bash")
+            );
+        }
+        assert_eq!(
+            claude_install_hint("windows"),
+            Some("irm https://claude.ai/install.ps1 | iex")
+        );
     }
 
     #[test]

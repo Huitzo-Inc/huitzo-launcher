@@ -43,10 +43,30 @@ The Huitzo **CLI** installs and runs natively on Windows — no WSL required.
 The Studio **runner** requires **WSL2** (its own outbound daemon and process
 model assume a POSIX shell, and its bootstrap is the `curl | sh` script): to
 pair a local runner on a Windows machine, install into WSL2 (Ubuntu) and run
-the Linux command above inside your distro. See
+the Linux command above inside your distro. In an administrator PowerShell run
+`wsl --install -d Ubuntu`, restart, and finish Ubuntu's username/password
+prompt (do not download Ubuntu or an ISO separately; the WSL welcome window can
+be closed). See
 [`docs/SUPPORT_MATRIX.md`](docs/SUPPORT_MATRIX.md) for the full support
 matrix and rationale (admin-locked corporate machines are marked
 unsupported).
+
+### Claude Code (required)
+
+The capability check requires Claude Code and a paid Claude plan (Pro, Max, Team
+or Enterprise) or Anthropic Console account. Install it with Anthropic's native
+installer (no Node.js needed), inside WSL2 on Windows:
+
+```sh
+curl -fsSL https://claude.ai/install.sh | bash
+```
+
+If `claude` is then "not found", add `~/.local/bin` to your PATH and open a new
+terminal:
+
+```sh
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc
+```
 
 ### Homebrew (macOS)
 
