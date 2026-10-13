@@ -154,6 +154,8 @@ jobs:
               apt-get update -qq >/dev/null
               apt-get install -y -qq curl ca-certificates python3 >/dev/null
               python3 -V
+              # Premise: the live feed can take this host's 3.12 wheel (#72).
+              python3 /repo/scripts/feed_fixture.py require cp312
               # Positive proof the trap is armed: `python -m venv` must fail here.
               if python3 -m venv /tmp/proof >/dev/null 2>&1; then
                 echo "::error::python3-venv is present, this case is no longer testing B3"; exit 1
@@ -187,6 +189,14 @@ jobs:
       # opposite half of the invariant — that what got installed is the feed's
       # wheel — via scripts/assert_install_outcome.sh. The refusal half now
       # lives on the two cases below.
+      #
+      # The premise "the feed has no wheel for 3.11" is CONSTRUCTED, not hoped
+      # for (#72): the feed gained a cp311 wheel and the case, which relied on
+      # the live feed lacking one, failed on a bare `grep`. scripts/feed_fixture.py
+      # now serves the newest live manifest with every cp311 wheel removed
+      # (HUITZO_RELEASE_URL), keeps downloading the real wheels from the live
+      # release (HUITZO_RELEASE_DOWNLOAD_URL), and fails with "premise no longer
+      # holds" if the live feed stops carrying anything else to install.
       - name: 'B4/T14 — ubuntu:22.04 with only python3.11 provisions and installs the real wheel'
         run: |
           set -euo pipefail
@@ -200,9 +210,22 @@ jobs:
               apt-get update -qq >/dev/null
               apt-get install -y -qq curl ca-certificates python3.11 >/dev/null
               ls /usr/bin/python3*
-              if [ -e /usr/bin/python3.12 ] || [ -e /usr/bin/python3.13 ]; then
-                echo "::error::a wheel-compatible Python is present, this case is not testing T14"; exit 1
+              if [ -e /usr/bin/python3.12 ] || [ -e /usr/bin/python3.13 ] || [ -e /usr/bin/python3.14 ]; then
+                echo "::error::premise no longer holds: a Python the feed can serve is installed, this case is not testing T14"; exit 1
               fi
+
+              # Serve the live feed minus every cp311 wheel. Wheels themselves
+              # still come from the live release, so the install is real.
+              DL=$(python3.11 /repo/scripts/feed_fixture.py fixture /feed cp311 http://127.0.0.1:8000)
+              ( cd /feed && python3.11 -m http.server 8000 >/dev/null 2>&1 & )
+              sleep 1
+              curl -sSf http://127.0.0.1:8000/releases > /dev/null
+              export HUITZO_RELEASE_URL=http://127.0.0.1:8000/releases
+              export HUITZO_RELEASE_DOWNLOAD_URL="$DL"
+              if grep -q "cp311" /feed/cli-release.json; then
+                echo "::error::premise no longer holds: the fixture feed still carries a cp311 wheel"; exit 1
+              fi
+
               sh /repo/install.sh > /tmp/install.log 2>&1 || { cat /tmp/install.log; exit 1; }
 
               "$HUITZO_HOME/bin/huitzo" --version > /tmp/version.txt 2>/tmp/run.log
