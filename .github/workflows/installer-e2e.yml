@@ -154,7 +154,7 @@ jobs:
               apt-get update -qq >/dev/null
               apt-get install -y -qq curl ca-certificates python3 >/dev/null
               python3 -V
-              # Premise: the live feed can take this host's 3.12 wheel (#72).
+              # Premise: the live feed can take a 3.12 wheel (#72).
               python3 /repo/scripts/feed_fixture.py require cp312
               # Positive proof the trap is armed: `python -m venv` must fail here.
               if python3 -m venv /tmp/proof >/dev/null 2>&1; then
