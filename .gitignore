@@ -1,2 +1,6 @@
 /target
 
+
+# Python bytecode (scripts/)
+__pycache__/
+*.pyc
