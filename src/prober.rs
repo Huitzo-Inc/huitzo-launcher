@@ -139,7 +139,7 @@ pub fn probe() -> CapabilityReport {
             &["claude"],
             &["--version"],
             true,
-            Some("npm install -g @anthropic-ai/claude-code"),
+            Some("curl -fsSL https://claude.ai/install.sh | bash"),
         ),
         probe_tool(
             "git",
