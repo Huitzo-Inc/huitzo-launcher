@@ -21,8 +21,8 @@ Usage:
         Exit 0 when the newest cli-v* release carries `linux-<arch>-ABI`.
     feed_fixture.py fixture DIR ABI BASE_URL
         Write DIR/releases and DIR/cli-release.json: the newest cli-v*
-        manifest minus every `*-ABI` wheel, served from BASE_URL. Print
-        `<version> <download-dir-url>` for HUITZO_RELEASE_DOWNLOAD_URL.
+        manifest minus every `*-ABI` wheel, served from BASE_URL. Print the
+        live release's download-dir URL, for HUITZO_RELEASE_DOWNLOAD_URL.
 
 Exit codes: 0 premise holds, 1 it does not or the feed is unreadable, 2 usage.
 """
