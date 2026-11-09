@@ -81,6 +81,25 @@ fn path_with_bin_dir_prepended() -> std::ffi::OsString {
     }
 }
 
+/// The variable that turns on Python's UTF-8 mode.
+#[cfg_attr(not(windows), allow(dead_code))]
+const PYTHON_UTF8_VAR: &str = "PYTHONUTF8";
+
+/// The UTF-8 mode setting the CLI is started with on Windows, unless the user chose one.
+///
+/// Windows Python otherwise reads and writes text, and redirected stdout/stderr, in
+/// the ANSI code page (cp1252 on en-US): `pack new` wrote a `huitzo.yaml` the CLI
+/// could not read back, and output piped to a file crashed on `✅` (cli#480). The
+/// CLI also guards itself; this covers older CLI wheels and the CLI's own stdin.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn utf8_mode_env(user_set: bool) -> Option<(&'static str, &'static str)> {
+    if user_set {
+        None
+    } else {
+        Some((PYTHON_UTF8_VAR, "1"))
+    }
+}
+
 #[cfg(unix)]
 fn exec_unix(venv_python: &Path, args: &[String]) -> Result<(), Error> {
     use std::ffi::CString;
@@ -112,6 +131,9 @@ fn exec_windows(venv_python: &Path, args: &[String]) -> Result<(), Error> {
 
     let mut cmd = Command::new(venv_python);
     cmd.args(args);
+    if let Some((key, value)) = utf8_mode_env(std::env::var_os(PYTHON_UTF8_VAR).is_some()) {
+        cmd.env(key, value);
+    }
 
     let status = cmd
         .status()
@@ -123,6 +145,12 @@ fn exec_windows(venv_python: &Path, args: &[String]) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn utf8_mode_is_set_unless_the_user_chose() {
+        assert_eq!(utf8_mode_env(false), Some(("PYTHONUTF8", "1")));
+        assert_eq!(utf8_mode_env(true), None);
+    }
 
     #[test]
     fn argv_carries_dash_p_only_when_supported() {
