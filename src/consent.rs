@@ -203,25 +203,14 @@ fn assume_yes() -> bool {
 }
 
 /// Whether stdin is an interactive terminal.
-#[cfg(unix)]
+///
+/// `IsTerminal` covers every platform: `isatty` on Unix, and on Windows a console
+/// handle or an MSYS/Cygwin pty (Git Bash, mintty). Windows used to answer `false`
+/// unconditionally, so an interactive `huitzo` that needed to re-bootstrap its venv
+/// declined its own install prompt and never installed (cli#479).
 fn is_stdin_tty() -> bool {
-    // SAFETY: isatty on a valid fd (0) has no preconditions beyond a valid
-    // descriptor; it only reads terminal state and cannot violate memory or
-    // thread invariants.
-    unsafe { libc_isatty(0) == 1 }
-}
-
-#[cfg(unix)]
-unsafe extern "C" {
-    #[link_name = "isatty"]
-    fn libc_isatty(fd: i32) -> i32;
-}
-
-#[cfg(windows)]
-fn is_stdin_tty() -> bool {
-    // Conservative on Windows (non-WSL is unsupported anyway): treat as
-    // non-TTY so piped installs fail closed unless HUITZO_ASSUME_YES is set.
-    false
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal()
 }
 
 #[cfg(test)]
